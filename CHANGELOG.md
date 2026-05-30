@@ -7,6 +7,14 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.1](https://github.com/tomchuk/npxc/compare/v0.1.0...v0.1.1) - 2026-05-30
+
+### Other
+
+- add recent npm supply-chain attack case studies to security model
+- add crates.io, docs.rs, CI, and license badges
+- add crates.io install instructions
+
 ## [0.1.0] — 2026-05-30
 
 ### Added
