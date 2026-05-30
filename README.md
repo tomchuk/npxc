@@ -1,5 +1,10 @@
 # npxc
 
+[![crates.io](https://img.shields.io/crates/v/npxc.svg)](https://crates.io/crates/npxc)
+[![docs.rs](https://docs.rs/npxc/badge.svg)](https://docs.rs/npxc)
+[![CI](https://github.com/tomchuk/npxc/actions/workflows/ci.yml/badge.svg)](https://github.com/tomchuk/npxc/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/crates/l/npxc.svg)](./LICENSE)
+
 Sandboxed npm execution for MCP servers.
 
 Runs Node.js / npm-based [Model Context Protocol](https://modelcontextprotocol.io) servers
