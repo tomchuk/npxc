@@ -246,6 +246,116 @@ memory = "1g"
 
 ---
 
+## Case studies: recent npm supply-chain attacks
+
+Nearly every npm supply-chain attack follows the same kill chain: an attacker
+compromises a maintainer account (usually by phishing) or a CI token, ships
+malicious code inside an otherwise-normal package, and then — at **install**
+time or at **runtime** — (1) reads host secrets and files, (2) exfiltrates them
+over the network, and (3) persists or self-propagates.
+
+`npxc` removes the capabilities each stage of that chain depends on. It moves
+`npm install` into an **ephemeral, isolated build VM** (so install scripts never
+touch your host filesystem, environment, or credentials), and it runs the server
+with **no network, no host environment variables, no host filesystem** (only
+explicitly-named in-CWD files, read-only), a **read-only root**, **all
+capabilities dropped**, and as a **non-root** user. The notes below describe how
+that posture maps onto specific, real incidents.
+
+> **Honest scoping.** `npxc` is strongest for the large class of MCP servers
+> that do *local* work (parsing, file analysis, format conversion), which should
+> run with the default `--network none`. Tools that inherently need the network
+> (sending email, calling an API) must opt into `network = "bridge"`, and `npxc`
+> cannot stop a tool from misusing the network it was *legitimately granted* —
+> it still contains filesystem, credential, and host damage, but covert
+> exfiltration over an allowed connection is out of scope. Also note that the
+> `npm install` step runs in an isolated VM but *does* have network (it must, to
+> fetch the package); the protection there is that it is sandboxed away from your
+> host, not that it is offline.
+
+### chalk, debug, ansi-styles, … — "Qix" maintainer phished (Sep 8, 2025)
+
+The most-downloaded compromise to date: a phishing email (from the look-alike
+domain `npmjs.help`) tricked the prolific maintainer *Qix* into resetting 2FA,
+and the attacker published malicious versions of ~18 foundational packages
+— `chalk`, `debug`, `ansi-styles`, `strip-ansi`, `color-convert`, and more —
+with a combined ~2–3 billion weekly downloads. The payload was a browser-side
+crypto-clipper that hooked `window.ethereum`/`fetch`/`XMLHttpRequest` to swap
+wallet addresses in transactions.
+
+**How `npxc` helps:** this particular payload only activates in a browser, so it
+would lie dormant in a Node MCP server. More generally, though, the lesson is
+that *any* dependency can be silently replaced — and had the same maintainer
+compromise shipped a Node-side stealer (the usual case below), `npxc`'s
+no-network, no-host-secrets sandbox would have left it nothing to steal and
+nowhere to send it.
+
+### "Shai-Hulud" worm — `@ctrl/tinycolor` + ~500 packages (Sep 2025)
+
+A self-replicating worm: on install, the payload downloaded TruffleHog, scanned
+the filesystem and environment for secrets (`NPM_TOKEN`, `GITHUB_TOKEN`,
+`AWS_ACCESS_KEY_ID`, …), probed cloud-metadata endpoints (`169.254.169.254`),
+validated the stolen npm token, then used it to **trojanize and republish other
+packages the victim owned** — propagating automatically — and exfiltrated
+findings to a webhook and to attacker-created public GitHub repositories.
+
+**How `npxc` helps:** the worm's entire premise is harvesting host/CI
+credentials and republishing with a stolen token. Under `npxc` the install runs
+in a throwaway VM with **no `~/.npmrc`, no host environment, no `~/.ssh`, no host
+cloud role**, so the credential sweep comes up empty; and the runtime server has
+**no network and no npm token**, so the self-propagation step (which must read a
+token and publish over the network) simply cannot run.
+
+### Nx "s1ngularity" — AI-assisted secret theft (Aug 26, 2025)
+
+A leaked CI publish token was used to ship malicious `nx` versions whose
+postinstall script harvested GitHub/npm tokens, SSH keys, `.env` files, and
+crypto wallets — even abusing locally-installed AI CLIs (`claude`, `gemini`,
+`q`) to enumerate sensitive files — then exfiltrated everything to public
+`s1ngularity-repository` repos under the victim's account. It also appended
+`sudo shutdown -h 0` to `~/.bashrc`/`~/.zshrc`, bricking interactive shells.
+
+**How `npxc` helps:** every target is on the *host* — `~/.npmrc`, `~/.ssh`,
+`.env`, wallet files, the host's AI CLIs, and the host shell RC files. The
+sandbox exposes none of them: no host filesystem, no host environment, no host
+binaries, and a read-only mount, so the harvest finds nothing and the
+shell-RC persistence/DoS can't touch the host. With no network at runtime, the
+exfiltration to GitHub also fails.
+
+### `postmark-mcp` — a malicious **MCP server** (Sep 2025)
+
+The most on-the-nose example for `npxc`: a trojanized npm package that posed as a
+Postmark email MCP server and silently **BCC'd every email it sent to an
+attacker-controlled address**. Because it was an MCP server, it ran with whatever
+trust the host gave it and exfiltrated mail in the normal flow of doing its job.
+
+**How `npxc` helps (and its limit):** most MCP servers do local work and should
+run with the default `--network none`, which turns "silently exfiltrates" into
+"cannot reach any network at all." An email sender, however, genuinely needs the
+network, so you would run it with `network = "bridge"` — and there `npxc` cannot
+stop a BCC over the connection the tool was granted. What it still buys you: the
+network is **off by default and opt-in per package**, and even when enabled the
+server has no access to your host filesystem, credentials, or other tools'
+data — so the blast radius is confined to the one capability you deliberately
+granted.
+
+### Earlier incidents, same shape
+
+- **`@solana/web3.js` (Dec 2024)** — a phished maintainer pushed versions
+  `1.95.6`/`1.95.7` that stole private keys to drain wallets. A key read and
+  shipped to the attacker is exactly what the no-network sandbox blocks.
+- **`ua-parser-js` (2021)** — account hijack delivered a cryptominer and a
+  credential stealer. No network → no mining pool and no exfiltration; CPU caps
+  and an ephemeral container limit the rest.
+- **`node-ipc` "protestware" (2022)** — wiped/overwrote files for users in
+  certain countries, geolocated by IP. With only read-only, in-CWD files
+  visible, there is nothing for it to destroy.
+- **`event-stream` (2018)** — a malicious transitive dependency targeted a
+  specific wallet app's funds. Scoping plus no network removes both the data and
+  the exfiltration path.
+
+---
+
 ## License
 
 MIT
