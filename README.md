@@ -10,10 +10,18 @@ with dynamic per-request filesystem scoping to the host process's working direct
 
 ## Installation
 
+### From crates.io
+
+```sh
+cargo install npxc --locked
+```
+
+(`--locked` builds against the published `Cargo.lock` for a reproducible build.)
+
 ### From source
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 Or build a release binary:
