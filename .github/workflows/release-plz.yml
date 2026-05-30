@@ -1,0 +1,78 @@
+name: Release-plz
+
+# On every push to `main`, release-plz maintains a "release PR" (version bump +
+# CHANGELOG). Merging that PR bumps the version on `main`, which lets the
+# `release` job publish to crates.io and push the git tag / GitHub release.
+#
+# Versions on crates.io are immutable, so publishing is intentionally gated
+# behind merging the release PR rather than firing on every commit.
+#
+# Publishing uses crates.io Trusted Publishing (OIDC) — there is no
+# `CARGO_REGISTRY_TOKEN` secret. One-time setup required (see CONTRIBUTING):
+#   1. Reserve the crate name with a manual `cargo publish` (Trusted Publishing
+#      cannot create a brand-new crate).
+#   2. On crates.io, configure a Trusted Publisher for this repo + this workflow
+#      file (`release-plz.yml`).
+#   3. In repo Settings → Actions → General, allow GitHub Actions to create and
+#      approve pull requests.
+
+on:
+  push:
+    branches: [main]
+
+# Least privilege at the workflow scope; each job grants only what it needs.
+permissions: {}
+
+jobs:
+  # Publish crates whose version was bumped by a merged release PR.
+  # On ordinary commits this is a no-op (nothing unreleased to publish).
+  release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'tomchuk' }}
+    permissions:
+      contents: write # push tags and create GitHub releases
+      pull-requests: read # detect the release PR and its commits
+      id-token: write # crates.io Trusted Publishing (OIDC)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Create/update the release PR (version bump + changelog) on every push.
+  release-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'tomchuk' }}
+    permissions:
+      contents: write # push to the release PR branch
+      pull-requests: write # create and update the release PR
+    # Serialize PR updates so concurrent pushes don't conflict. Do NOT cancel
+    # in-progress runs here (unlike the release job) — losing a PR update is fine.
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

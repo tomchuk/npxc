@@ -1,0 +1,68 @@
+[package]
+name        = "npxc"
+version     = "0.1.0"
+edition     = "2024"
+rust-version = "1.87"
+description = "Sandboxed npm execution for MCP servers via Apple container"
+license     = "MIT"
+repository  = "https://github.com/tomchuk/npxc"
+homepage    = "https://github.com/tomchuk/npxc"
+readme      = "README.md"
+keywords    = ["mcp", "sandbox", "container", "npx", "security"]
+categories  = ["command-line-utilities", "development-tools"]
+exclude     = ["examples/sample.pdf", ".github", "target"]
+
+[[bin]]
+name = "npxc"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (only the features npxc actually uses)
+tokio              = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "io-std",
+    "fs",
+    "sync",
+    "signal",
+    "time",
+] }
+
+# CLI
+clap               = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+toml               = "0.8"
+semver             = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors
+thiserror          = "2"
+anyhow             = "1"
+
+# Concurrency
+parking_lot        = "0.12"
+
+# Misc
+uuid               = { version = "1", features = ["v4"] }
+directories        = "5"
+which              = "6"
+
+tempfile           = "3"
+
+[dev-dependencies]
+assert_cmd         = "2"
+predicates         = "3"
+
+[features]
+e2e = []
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

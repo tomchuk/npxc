@@ -1,0 +1,43 @@
+ARG NODE_IMAGE=node:lts-slim
+ARG PACKAGE_SPEC
+
+FROM ${NODE_IMAGE} AS builder
+ARG PACKAGE_SPEC
+WORKDIR /app
+RUN npm init -y >/dev/null \
+ && npm install --omit=dev --no-audit --no-fund "${PACKAGE_SPEC}"
+
+# Compute an entrypoint shim from the package's "bin" field at build time.
+# Single-quoted heredoc marker prevents shell from expanding ${abs} / "$@",
+# which are JavaScript — not shell — expressions inside the script.
+COPY <<'EOF' /app/gen-entry.js
+const fs = require("fs"), path = require("path");
+const spec = process.argv[2].replace(/@[^@/]+$/, "");
+const pkgDir = path.join("/app/node_modules", spec);
+const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+const bin = typeof pkg.bin === "string" ? pkg.bin
+          : pkg.bin ? Object.values(pkg.bin)[0]
+          : (() => { throw new Error("package has no bin entry"); })();
+const abs = path.resolve(pkgDir, bin);
+fs.writeFileSync("/app/entry.sh",
+  `#!/bin/sh\nexec node ${abs} "$@"\n`, { mode: 0o755 });
+EOF
+RUN node /app/gen-entry.js $PACKAGE_SPEC
+
+# Strip docs/tests/sourcemaps.
+RUN find /app/node_modules -type d \
+      \( -name test -o -name tests -o -name __tests__ -o -name docs \) \
+      -prune -exec rm -rf {} + 2>/dev/null || true \
+ && find /app/node_modules -type f \
+      \( -name '*.md' -o -name 'CHANGELOG*' -o -name '*.map' \) \
+      -delete 2>/dev/null || true
+
+FROM ${NODE_IMAGE} AS runtime
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/bin/npm /usr/local/bin/npx \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder --chown=node:node /app /app
+WORKDIR /workspace
+USER node:node
+ENTRYPOINT ["/app/entry.sh"]
