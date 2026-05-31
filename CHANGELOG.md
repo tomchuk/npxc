@@ -7,6 +7,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.0](https://github.com/tomchuk/npxc/compare/v0.1.1...v0.2.0) - 2026-05-31
+
+### Added
+
+- env injection, arg forwarding, persistent storage, directory mounts, npx -y compatibility
+
 ## [0.1.1](https://github.com/tomchuk/npxc/compare/v0.1.0...v0.1.1) - 2026-05-30
 
 ### Other
