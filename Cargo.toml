@@ -56,6 +56,9 @@ directories        = "5"
 which              = "6"
 
 tempfile           = "3"
+boringtun = { version = "0.7", default-features = false }
+base64 = "0.22"
+getrandom = "0.4.2"
 
 [dev-dependencies]
 assert_cmd         = "2"
