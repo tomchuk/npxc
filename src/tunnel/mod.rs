@@ -17,6 +17,6 @@ pub mod keys;
 pub mod wg;
 
 pub use device::WgDevice;
-pub use endpoint::Tunnel;
+pub use endpoint::{Tunnel, TunnelSetup, establish};
 pub use keys::WgKeypair;
 pub use wg::WgTunnel;

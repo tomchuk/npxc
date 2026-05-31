@@ -4,21 +4,124 @@
 //! to a real host socket. This is the passthrough (allow-all) datapath; egress
 //! policy is layered on later.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
 
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::device::WgDevice;
+use super::keys::WgKeypair;
+use super::wg::WgTunnel;
+use crate::error::NpxcError;
 
 /// Guest-side tunnel MTU. Must match the `wg0` MTU configured in the guest.
 pub const MTU: u16 = 1380;
 
+/// Tunnel-internal address assigned to the guest's `wg0` interface.
+const GUEST_WG_ADDRESS: &str = "10.7.0.2/32";
+
+/// Resolver the guest is pointed at. Reached through the tunnel (the guest's
+/// default route is `wg0`), so DNS is forwarded by npxc regardless of the
+/// host's own DNS configuration.
+const TUNNEL_NAMESERVER: &str = "1.1.1.1";
+
 /// Per-UDP-flow relay buffer size.
 const UDP_BUF: usize = 2048;
+
+/// The running host side of a session's egress tunnel plus the environment the
+/// guest entrypoint needs to bring up its end.
+pub struct TunnelSetup {
+    /// The live datapath; keep it alive for the session's duration.
+    pub tunnel: Tunnel,
+    /// `NPXC_WG_*` variables to inject into the container.
+    pub env: Vec<(String, String)>,
+    /// Per-session `resolv.conf` to mount over the guest's `/etc/resolv.conf`
+    /// so DNS routes through the tunnel. Kept alive (and deleted) with the
+    /// session.
+    pub resolv_conf: NamedTempFile,
+}
+
+/// Establish the host side of the egress tunnel.
+///
+/// Generates the per-session `WireGuard` keypairs, binds a UDP socket, spawns
+/// the datapath, and returns the running [`Tunnel`] together with the
+/// environment variables the guest entrypoint reads to configure `wg0`.
+///
+/// `gateway` is the container network's gateway — the host address the guest
+/// reaches over the host-only network, and thus the `WireGuard` endpoint it
+/// dials.
+///
+/// # Errors
+///
+/// Returns [`NpxcError::Runtime`] if the UDP socket cannot be bound.
+pub async fn establish(gateway: IpAddr) -> Result<TunnelSetup, NpxcError> {
+    let npxc_kp = WgKeypair::generate();
+    let guest_kp = WgKeypair::generate();
+
+    // Bind to all interfaces (ephemeral port). The gateway address may not be
+    // assigned to a host interface until a container attaches, and WireGuard
+    // authentication drops any datagram that isn't from our peer, so binding
+    // broadly is both robust and safe.
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(|e| NpxcError::Runtime(format!("failed to bind tunnel UDP socket: {e}")))?;
+    let port = socket
+        .local_addr()
+        .map_err(|e| NpxcError::Runtime(format!("tunnel socket has no local address: {e}")))?
+        .port();
+
+    let device = WgDevice::new(
+        socket,
+        WgTunnel::new(npxc_kp.secret(), guest_kp.public(), 1),
+    );
+    let tunnel = Tunnel::spawn(device);
+
+    let env = guest_env(&guest_kp, &npxc_kp, gateway, port);
+    let resolv_conf = write_resolv_conf()?;
+    Ok(TunnelSetup {
+        tunnel,
+        env,
+        resolv_conf,
+    })
+}
+
+/// Write a per-session `resolv.conf` pointing at a tunnel-routable resolver.
+///
+/// It is made world-readable so the container's unprivileged `node` user can
+/// read it once mounted over `/etc/resolv.conf`.
+fn write_resolv_conf() -> Result<NamedTempFile, NpxcError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("npxc-resolv-")
+        .tempfile()
+        .map_err(NpxcError::Io)?;
+    writeln!(file, "nameserver {TUNNEL_NAMESERVER}").map_err(NpxcError::Io)?;
+    file.flush().map_err(NpxcError::Io)?;
+    std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644))
+        .map_err(NpxcError::Io)?;
+    Ok(file)
+}
+
+/// Build the `NPXC_WG_*` environment the guest entrypoint consumes.
+fn guest_env(
+    guest: &WgKeypair,
+    npxc: &WgKeypair,
+    gateway: IpAddr,
+    port: u16,
+) -> Vec<(String, String)> {
+    vec![
+        ("NPXC_WG_PRIVATE_KEY".to_string(), guest.private_base64()),
+        ("NPXC_WG_PEER_PUBLIC_KEY".to_string(), npxc.public_base64()),
+        ("NPXC_WG_ENDPOINT".to_string(), format!("{gateway}:{port}")),
+        ("NPXC_WG_ADDRESS".to_string(), GUEST_WG_ADDRESS.to_string()),
+        ("NPXC_WG_MTU".to_string(), MTU.to_string()),
+    ]
+}
 
 /// A running tunnel datapath. Dropping or [`abort`](Tunnel::abort)ing it tears
 /// down the `ipstack` accept loop (in-flight forwarders finish on their own).
@@ -119,6 +222,24 @@ mod tests {
 
     use crate::tunnel::keys::WgKeypair;
     use crate::tunnel::wg::WgTunnel;
+
+    #[test]
+    fn guest_env_has_expected_keys_and_endpoint() {
+        let guest = WgKeypair::generate();
+        let npxc = WgKeypair::generate();
+        let gateway: IpAddr = Ipv4Addr::new(192, 168, 66, 1).into();
+        let env = guest_env(&guest, &npxc, gateway, 51820);
+
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["NPXC_WG_PRIVATE_KEY"], guest.private_base64());
+        assert_eq!(map["NPXC_WG_PEER_PUBLIC_KEY"], npxc.public_base64());
+        assert_eq!(map["NPXC_WG_ENDPOINT"], "192.168.66.1:51820");
+        assert_eq!(map["NPXC_WG_ADDRESS"], GUEST_WG_ADDRESS);
+        assert_eq!(map["NPXC_WG_MTU"], MTU.to_string());
+        // The guest gets its own private key and npxc's public key — never the
+        // reverse, so npxc's secret stays on the host.
+        assert_ne!(map["NPXC_WG_PRIVATE_KEY"], npxc.private_base64());
+    }
 
     /// Build a valid IPv4 + UDP packet with correct checksums.
     fn ipv4_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {

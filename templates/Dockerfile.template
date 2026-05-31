@@ -1,6 +1,12 @@
 ARG NODE_IMAGE=node:lts-slim
 ARG PACKAGE_SPEC
 
+# Build a userspace WireGuard (boringtun) for the guest. The container VM kernel
+# has no WireGuard module, so the guest brings up wg0 in userspace over a TUN
+# device instead. This stage is cached across image rebuilds.
+FROM rust:1-bookworm AS wgbuild
+RUN cargo install boringtun-cli --version 0.7.1 --root /usr/local
+
 FROM ${NODE_IMAGE} AS builder
 ARG PACKAGE_SPEC
 WORKDIR /app
@@ -8,8 +14,12 @@ RUN npm init -y >/dev/null \
  && npm install --omit=dev --no-audit --no-fund "${PACKAGE_SPEC}"
 
 # Compute an entrypoint shim from the package's "bin" field at build time.
-# Single-quoted heredoc marker prevents shell from expanding ${abs} / "$@",
-# which are JavaScript — not shell — expressions inside the script.
+# Single-quoted heredoc marker prevents shell from expanding ${abs} / "$@" /
+# $NPXC_* tokens, which are JavaScript or guest-shell — not build-shell —
+# expressions. The generated /app/entry.sh runs as root: if WireGuard config
+# is present in the environment it starts a userspace WireGuard interface and
+# routes all egress through the tunnel, then drops to the unprivileged `node`
+# user to exec the server.
 COPY <<'EOF' /app/gen-entry.js
 const fs = require("fs"), path = require("path");
 const spec = process.argv[2].replace(/@[^@/]+$/, "");
@@ -19,8 +29,22 @@ const bin = typeof pkg.bin === "string" ? pkg.bin
           : pkg.bin ? Object.values(pkg.bin)[0]
           : (() => { throw new Error("package has no bin entry"); })();
 const abs = path.resolve(pkgDir, bin);
-fs.writeFileSync("/app/entry.sh",
-  `#!/bin/sh\nexec node ${abs} "$@"\n`, { mode: 0o755 });
+const lines = [
+  "#!/bin/sh",
+  "set -e",
+  'if [ -n "$NPXC_WG_PRIVATE_KEY" ]; then',
+  "  mkdir -p /run/wireguard",
+  "  boringtun-cli --disable-drop-privileges wg0 >&2",
+  '  i=0; while [ ! -S /run/wireguard/wg0.sock ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done',
+  `  printf '%s' "$NPXC_WG_PRIVATE_KEY" | wg set wg0 private-key /dev/stdin`,
+  '  wg set wg0 peer "$NPXC_WG_PEER_PUBLIC_KEY" endpoint "$NPXC_WG_ENDPOINT" allowed-ips 0.0.0.0/0 persistent-keepalive 25',
+  '  ip address add "$NPXC_WG_ADDRESS" dev wg0',
+  '  ip link set wg0 mtu "${NPXC_WG_MTU:-1380}" up',
+  "  ip route replace default dev wg0",
+  "fi",
+  `exec setpriv --reuid 1000 --regid 1000 --clear-groups node ${abs} "$@"`,
+];
+fs.writeFileSync("/app/entry.sh", lines.join("\n") + "\n", { mode: 0o755 });
 EOF
 RUN node /app/gen-entry.js $PACKAGE_SPEC
 
@@ -33,11 +57,21 @@ RUN find /app/node_modules -type d \
       -delete 2>/dev/null || true
 
 FROM ${NODE_IMAGE} AS runtime
-RUN rm -rf /usr/local/lib/node_modules/npm \
+# wireguard-tools (`wg`) + iproute2 (`ip`) configure the tunnel; npm/npx are
+# removed so the package cannot self-install at runtime. `setpriv` (util-linux,
+# present in the base) drops privileges.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends wireguard-tools iproute2 \
+ && rm -rf /usr/local/lib/node_modules/npm \
            /usr/local/bin/npm /usr/local/bin/npx \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Userspace WireGuard daemon (kernel has no wireguard module).
+COPY --from=wgbuild /usr/local/bin/boringtun-cli /usr/local/bin/boringtun-cli
 WORKDIR /app
 COPY --from=builder --chown=node:node /app /app
 WORKDIR /workspace
-USER node:node
+# The entrypoint starts as root (to start wg0 + configure networking when in
+# tunnel mode) and drops to `node` via setpriv before exec'ing the server. With
+# --cap-drop ALL and no --cap-add (non-tunnel mode), root holds no capabilities
+# and the drop is immediate.
 ENTRYPOINT ["/app/entry.sh"]

@@ -4,7 +4,7 @@ use tokio::process::Command;
 use tracing::debug;
 
 use crate::{
-    config::{EffectiveConfig, sanitize_package_name},
+    config::{EffectiveConfig, data_dir, sanitize_package_name},
     error::NpxcError,
     paths::{SessionState, validate_path},
 };
@@ -77,6 +77,12 @@ pub struct LaunchPlan {
     ///
     /// These are forwarded verbatim to the container's entrypoint.
     pub args: Vec<String>,
+
+    /// Linux capabilities to add back on top of `--cap-drop ALL`.
+    ///
+    /// Each entry becomes a `--cap-add <CAP>` argument. Used by tunnel mode to
+    /// grant `NET_ADMIN` so the entrypoint can configure `wg0`.
+    pub cap_add: Vec<String>,
 }
 
 impl LaunchPlan {
@@ -98,10 +104,8 @@ impl LaunchPlan {
     /// # Errors
     ///
     /// Returns [`NpxcError::PathOutOfScope`] or [`NpxcError::PathNotFound`]
-    /// if a config-declared mount path fails CWD validation,
-    /// [`NpxcError::Config`] if the platform data directory cannot be
-    /// determined, or [`NpxcError::Io`] if the persistent storage directory
-    /// cannot be created.
+    /// if a config-declared mount path fails CWD validation, or
+    /// [`NpxcError::Io`] if the persistent storage directory cannot be created.
     pub fn build(
         pkg_name: &str,
         effective: &EffectiveConfig,
@@ -118,6 +122,7 @@ impl LaunchPlan {
                 .collect(),
             env_passthrough: effective.env_passthrough.clone(),
             mounts: Vec::new(),
+            cap_add: Vec::new(),
         };
 
         // Config-declared directory mounts, validated within CWD scope.
@@ -139,14 +144,10 @@ impl LaunchPlan {
         // Persistent storage: per-package host dir mounted rw at /data.
         if effective.storage.as_ref().is_some_and(|s| s.persist) {
             let sanitized = sanitize_package_name(pkg_name);
-            let data_dir = directories::ProjectDirs::from("", "", "npxc")
-                .map(|dirs| dirs.data_dir().join("packages").join(&sanitized))
-                .ok_or_else(|| {
-                    NpxcError::Config("cannot determine platform data directory".into())
-                })?;
-            std::fs::create_dir_all(&data_dir)?;
+            let host_dir = data_dir().join("packages").join(&sanitized);
+            std::fs::create_dir_all(&host_dir)?;
             plan.mounts.push(Mount {
-                host: data_dir,
+                host: host_dir,
                 container: "/data".to_string(),
                 mode: MountMode::Rw,
             });
@@ -263,6 +264,10 @@ impl Session {
             "--read-only",
             "--tmpfs",
             "/tmp",
+            // Writable /run for the userspace WireGuard control socket
+            // (/run/wireguard/wg0.sock) under the otherwise read-only root.
+            "--tmpfs",
+            "/run",
             "--cap-drop",
             "ALL",
             "-m",
@@ -294,6 +299,11 @@ impl Session {
         // Passthrough env var names (-e K — container inherits value from npxc env).
         for k in &plan.env_passthrough {
             cmd.args(["-e", k]);
+        }
+
+        // Capabilities added back on top of --cap-drop ALL (e.g. NET_ADMIN).
+        for cap in &plan.cap_add {
+            cmd.args(["--cap-add", cap]);
         }
 
         // Image tag comes after all flags.

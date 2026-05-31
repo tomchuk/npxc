@@ -11,8 +11,10 @@ use npxc::{
     error::NpxcError,
     rpc::pipeline,
     runtime::{
-        LaunchPlan, ManagedNetwork, Session, ensure_image, image_tag, list_images, remove_image,
+        LaunchPlan, ManagedNetwork, Mount, MountMode, Session, ensure_image, image_tag,
+        list_images, remove_image,
     },
+    tunnel,
 };
 
 // ── Entry-point ───────────────────────────────────────────────────────────────
@@ -93,12 +95,41 @@ async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcEr
         tracing::error!("failed to pin version for {pkg_name}@{version}: {e}");
     }
 
-    let plan = LaunchPlan::build(&pkg_name, &effective, &cwd, pkg_args, global.no_isolate)?;
+    let mut plan = LaunchPlan::build(&pkg_name, &effective, &cwd, pkg_args, global.no_isolate)?;
 
     // Provision the per-session network (creates an isolated `--internal`
     // network for allowlist mode; a no-op otherwise) before launching.
     let (network_arg, managed_network) =
         ManagedNetwork::provision(&effective.network, &effective.container_cli).await?;
+
+    // For allowlist mode, stand up the egress tunnel on the network's gateway
+    // and inject its config + the NET_ADMIN capability the guest needs to bring
+    // up `wg0`. The returned tunnel must outlive the container, so it is held
+    // in `_tunnel` until the session finishes below.
+    let _tunnel = match (&effective.network, &managed_network) {
+        (NetworkPolicy::Allowlist { .. }, Some(net)) => {
+            let gateway = net.gateway.parse().map_err(|e| {
+                NpxcError::Runtime(format!("invalid gateway address {:?}: {e}", net.gateway))
+            })?;
+            let setup = tunnel::establish(gateway).await?;
+            plan.env_literal.extend(setup.env.iter().cloned());
+            // Mount npxc's resolv.conf so the guest resolves through the tunnel
+            // rather than the host's (possibly host-only-unreachable) resolver.
+            plan.mounts.push(Mount {
+                host: setup.resolv_conf.path().to_path_buf(),
+                container: "/etc/resolv.conf".to_string(),
+                mode: MountMode::Ro,
+            });
+            // NET_ADMIN: configure wg0. SETUID/SETGID: drop root → node after
+            // setup. All three are used only by the trusted entrypoint; the
+            // server process ends up unprivileged with no capabilities.
+            for cap in ["NET_ADMIN", "SETUID", "SETGID"] {
+                plan.cap_add.push(cap.to_string());
+            }
+            Some(setup)
+        }
+        _ => None,
+    };
 
     let mut session = match Session::start(&pkg_name, &tag, &effective, &network_arg, &plan, None) {
         Ok(session) => session,
