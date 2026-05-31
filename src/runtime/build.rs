@@ -182,20 +182,28 @@ pub async fn ensure_image(
 
 // ── Listing ───────────────────────────────────────────────────────────────────
 
+/// Minimal image record from `container image list --format json`.
+///
+/// Only `reference` is required; the full OCI descriptor is ignored.
+#[derive(serde::Deserialize)]
+struct ContainerImage {
+    reference: String,
+}
+
 /// List all npxc-managed images in the local image store.
 ///
-/// Runs `<container_cli> image ls` and filters rows whose first
-/// whitespace-separated field starts with `"npxc/"`.
-///
-/// Returns a `Vec<(repository, tag)>` pair for each matching row.
+/// Runs `<container_cli> image list --format json` and returns a
+/// `Vec<(repository, tag)>` for every image whose reference starts with
+/// `"npxc/"`.
 ///
 /// # Errors
 ///
 /// Returns [`NpxcError::RuntimeNotAvailable`] if the container CLI cannot be
-/// spawned.
+/// spawned, [`NpxcError::Runtime`] if the command exits non-zero, or
+/// [`NpxcError::Json`] if the output is not valid JSON.
 pub async fn list_images(container_cli: &str) -> Result<Vec<(String, String)>, NpxcError> {
     let mut cmd = Command::new(container_cli);
-    cmd.args(["image", "ls"]);
+    cmd.args(["image", "list", "--format", "json"]);
 
     debug!(cmd = ?cmd, "running container command");
 
@@ -203,23 +211,27 @@ pub async fn list_images(container_cli: &str) -> Result<Vec<(String, String)>, N
         NpxcError::RuntimeNotAvailable(format!("failed to spawn '{container_cli}': {e}"))
     })?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut images = Vec::new();
-
-    for line in stdout.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(repo) = fields.next() else {
-            continue;
-        };
-        if !repo.starts_with("npxc/") {
-            continue;
-        }
-        // Second column is the tag; default to empty string if absent.
-        let tag = fields.next().unwrap_or("").to_string();
-        images.push((repo.to_string(), tag));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(NpxcError::Runtime(format!(
+            "`{container_cli} image list` failed: {}",
+            stderr.trim()
+        )));
     }
 
-    Ok(images)
+    let all: Vec<ContainerImage> = serde_json::from_slice(&output.stdout)?;
+
+    Ok(all
+        .into_iter()
+        .filter(|img| img.reference.starts_with("npxc/"))
+        .filter_map(|img| {
+            // Split on the last `:` to separate repository from tag.
+            // npxc images never contain a registry prefix, so the `npxc/`
+            // filter above guarantees the colon is the tag separator.
+            let (repo, tag) = img.reference.rsplit_once(':')?;
+            Some((repo.to_string(), tag.to_string()))
+        })
+        .collect())
 }
 
 // ── Removal ───────────────────────────────────────────────────────────────────

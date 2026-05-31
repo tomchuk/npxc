@@ -10,7 +10,7 @@ use npxc::{
     config,
     error::NpxcError,
     rpc::pipeline,
-    runtime::{Session, ensure_image, image_tag, list_images, remove_image},
+    runtime::{LaunchPlan, Session, ensure_image, image_tag, list_images, remove_image},
 };
 
 // ── Entry-point ───────────────────────────────────────────────────────────────
@@ -50,13 +50,12 @@ async fn run(cli: Cli) -> Result<(), NpxcError> {
 
 /// Start a sandboxed MCP session for `args[0]` (the package spec).
 ///
-/// `args[1..]` (with bare `--` separators stripped) are the package's own
-/// arguments; they are captured for future use but not yet forwarded to the
-/// container CLI.
+/// `args[1..]` (with bare `--` separators stripped) are forwarded verbatim to
+/// the container's entrypoint as the package's own arguments.
 async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcError> {
     let pkg_spec = args.first().cloned().unwrap_or_default();
-    // Filter bare "--" separators; args are forwarded to the container image.
-    let _pkg_args: Vec<&String> = args[1..].iter().filter(|a| *a != "--").collect();
+    // Filter bare "--" separators; forward remaining args to the container.
+    let pkg_args: Vec<String> = args[1..].iter().filter(|a| *a != "--").cloned().collect();
 
     let config_path = global.config.as_ref();
     let (effective, pkg_name, version) = config::resolve_config(&pkg_spec, config_path)?;
@@ -79,6 +78,7 @@ async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcEr
         println!("version:    {version}");
         println!("image_tag:  {tag}");
         println!("no_isolate: {}", global.no_isolate);
+        println!("args:       {pkg_args:?}");
         return Ok(());
     }
 
@@ -90,10 +90,8 @@ async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcEr
         tracing::error!("failed to pin version for {pkg_name}@{version}: {e}");
     }
 
-    // In --no-isolate mode, mount the whole CWD read-only instead of
-    // publishing individual files on demand.
-    let extra_ro_mount = global.no_isolate.then_some(cwd.as_path());
-    let mut session = Session::start(&pkg_name, &tag, &effective, extra_ro_mount, None)?;
+    let plan = LaunchPlan::build(&pkg_name, &effective, &cwd, pkg_args, global.no_isolate)?;
+    let mut session = Session::start(&pkg_name, &tag, &effective, &plan, None)?;
 
     tracing::info!(
         package = %pkg_name,
@@ -195,194 +193,41 @@ fn cmd_inspect(package_spec: &str, global: &GlobalOpts) -> Result<(), NpxcError>
     println!("mount_mode:    {}", effective.mount_mode);
     println!("strategies:    {:?}", effective.strategies);
 
+    // Env grant sheet: key names for literals, variable names for passthrough.
+    if !effective.env.is_empty() {
+        let mut pairs: Vec<_> = effective.env.keys().collect();
+        pairs.sort();
+        println!("env:           {pairs:?}");
+    }
+    if !effective.env_passthrough.is_empty() {
+        println!("env_passthrough: {:?}", effective.env_passthrough);
+    }
+
+    // Storage and mount summary.
+    if let Some(storage) = &effective.storage {
+        if storage.persist {
+            println!("storage:       persist → /data (rw)");
+        }
+        if !storage.writable.is_empty() {
+            println!("storage.writable: {:?}", storage.writable);
+        }
+    }
+    if !effective.mounts.is_empty() {
+        for mc in &effective.mounts {
+            println!(
+                "mount:         {} → {} ({})",
+                mc.host, mc.container, mc.mode
+            );
+        }
+    }
+
     Ok(())
 }
 
 /// Check prerequisites: verify the container runtime is available, print its
-/// version, and run `container system install` to ensure the VM kernel is
-/// configured.
+/// version, and ensure the VM kernel is configured.
 async fn cmd_doctor(global: GlobalOpts) -> Result<(), NpxcError> {
     let cfg = config::load_global_config(global.config.as_ref())?;
-    let container_cli = cfg.defaults.container_cli;
-
-    if !doctor_report_cli(&container_cli).await {
-        return Ok(());
-    }
-
-    println!();
-    println!("container system:");
-
-    let status_text = doctor_system_status_text(&container_cli).await;
-    if doctor_ensure_system_running(&container_cli, &status_text).await {
-        doctor_ensure_kernel(&container_cli, &status_text).await;
-    }
-
-    doctor_ensure_rosetta_disabled(&container_cli).await;
-
+    npxc::doctor::run(&cfg.defaults.container_cli).await;
     Ok(())
-}
-
-/// Verify the container CLI is on `PATH` and print its version. Returns `false`
-/// (after printing install instructions) when the CLI is not found.
-async fn doctor_report_cli(container_cli: &str) -> bool {
-    let Ok(bin_path) = which::which(container_cli) else {
-        println!("container CLI:  {container_cli} (NOT FOUND)");
-        println!("  Install from: https://github.com/apple/container/releases");
-        return false;
-    };
-    println!("container CLI:  {} (found)", bin_path.display());
-
-    match tokio::process::Command::new(container_cli)
-        .arg("--version")
-        .output()
-        .await
-    {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let version_str = stdout.trim();
-            if version_str.is_empty() {
-                // Apple container prints version to stderr.
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                println!("  version:      {}", stderr.trim());
-            } else {
-                println!("  version:      {version_str}");
-            }
-        }
-        Err(e) => println!("  version:      (error running `{container_cli} --version`: {e})"),
-    }
-    true
-}
-
-/// Capture the stdout of `container system status` (empty string on error).
-async fn doctor_system_status_text(container_cli: &str) -> String {
-    let bytes = tokio::process::Command::new(container_cli)
-        .args(["system", "status"])
-        .output()
-        .await
-        .map(|o| o.stdout)
-        .unwrap_or_default();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Ensure the container system service is running, starting it (with kernel
-/// install) if necessary. Returns whether the service is running afterwards.
-async fn doctor_ensure_system_running(container_cli: &str, status_text: &str) -> bool {
-    if status_text.contains("running") {
-        println!("  status:  running ✓");
-        return true;
-    }
-    println!("  status:  not running — starting (with kernel install)...");
-    match tokio::process::Command::new(container_cli)
-        .args(["system", "start", "--enable-kernel-install"])
-        .status()
-        .await
-    {
-        Ok(s) if s.success() => {
-            println!("  status:  started ✓");
-            true
-        }
-        Ok(s) => {
-            println!(
-                "  status:  `{container_cli} system start` failed (exit code: {:?})",
-                s.code()
-            );
-            false
-        }
-        Err(e) => {
-            println!("  status:  failed to start: {e}");
-            false
-        }
-    }
-}
-
-/// Ensure a default kernel is installed.
-///
-/// `container system kernel set` stores kernels under `<appRoot>/kernels/`,
-/// which is not reflected in `container system property list`, so the directory
-/// is checked directly using the `appRoot` reported by `system status`.
-async fn doctor_ensure_kernel(container_cli: &str, status_text: &str) {
-    // The status table format is: "appRoot            /path/to/dir/"
-    let app_root = status_text.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("appRoot")
-            .map(|rest| std::path::PathBuf::from(rest.trim()))
-    });
-
-    let kernel_present = app_root.as_ref().is_some_and(|root| {
-        let kernels_dir = root.join("kernels");
-        std::fs::read_dir(&kernels_dir).is_ok_and(|mut d| d.next().is_some())
-    });
-
-    if kernel_present {
-        println!("  kernel:  configured ✓");
-        return;
-    }
-    println!("  kernel:  not configured — installing recommended kernel...");
-    match tokio::process::Command::new(container_cli)
-        .args(["system", "kernel", "set", "--recommended"])
-        .status()
-        .await
-    {
-        Ok(s) if s.success() => println!("  kernel:  installed ✓"),
-        Ok(s) => {
-            println!(
-                "  kernel:  `{container_cli} system kernel set --recommended` failed (exit code: {:?})",
-                s.code()
-            );
-            println!("           Run it manually for details.");
-        }
-        Err(e) => println!("  kernel:  failed to run: {e}"),
-    }
-}
-
-/// If Rosetta is not installed, disable `build.rosetta` and reset the
-/// `BuildKit` builder so cross-arch builds don't fail at bootstrap.
-async fn doctor_ensure_rosetta_disabled(container_cli: &str) {
-    let rosetta_installed = tokio::process::Command::new("/usr/bin/arch")
-        .args(["-x86_64", "/usr/bin/true"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-
-    if rosetta_installed {
-        return;
-    }
-
-    // Disable Rosetta for builds via the property system.
-    let prop_ok = tokio::process::Command::new(container_cli)
-        .args(["system", "property", "set", "build.rosetta", "false"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-
-    if prop_ok {
-        println!("  build:   Rosetta not installed \u{2014} set build.rosetta=false \u{2713}");
-    } else {
-        println!("  build:   Rosetta not installed but could not set property");
-        println!("           Run: {container_cli} system property set build.rosetta false");
-    }
-
-    // The BuildKit builder caches its launch config. Reset it so the next
-    // build starts a fresh builder that reads the updated property.
-    let stopped = tokio::process::Command::new(container_cli)
-        .args(["builder", "stop"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-    let deleted = tokio::process::Command::new(container_cli)
-        .args(["builder", "delete", "--force"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-    if stopped || deleted {
-        println!("  build:   builder reset \u{2713}");
-    }
 }

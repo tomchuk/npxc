@@ -13,6 +13,7 @@
 pub mod cli;
 pub mod config;
 pub mod dockerfile;
+pub mod doctor;
 pub mod error;
 pub mod paths;
 pub mod rpc;

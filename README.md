@@ -74,20 +74,22 @@ an MCP server as a command works unchanged — just replace `npx` with `npxc`:
 
 ```sh
 # Before
-npx @scope/package-name
+npx -y @scope/package-name
 
 # After — same interface, sandboxed
 npxc @scope/package-name
-npxc @scope/package-name@1.2.3     # pin a specific version
-npxc @scope/package-name -- --arg val
+npxc @scope/package-name@1.2.3          # pin a specific version
+npxc @scope/package-name -- --arg val   # args forwarded to the server
 ```
 
-In any MCP client config that accepts a `command` + `args`, substitute accordingly:
+The leading `-y`/`--yes` that MCP clients commonly emit (from the `npx -y`
+convention) is silently absorbed, so configs copied verbatim from `npx` to
+`npxc` work without modification:
 
 ```json
 {
   "command": "npxc",
-  "args": ["@scope/package-name"]
+  "args": ["-y", "@scope/package-name", "--extra-arg"]
 }
 ```
 
@@ -105,10 +107,7 @@ three scenarios against `@sylphx/pdf-reader-mcp`:
 3. **Scope test** — attempt to read `/etc/passwd`, expect a `-32602` rejection
 
 ```sh
-# Build the binary first, then run the example
 cargo build --release && cargo run --release --example mcp_probe
-
-# Or pass a specific PDF path
 cargo build --release && cargo run --release --example mcp_probe /path/to/file.pdf
 ```
 
@@ -122,17 +121,17 @@ cargo build --release && cargo run --release --example mcp_probe /path/to/file.p
 | `npxc list` | List all cached `npxc/…` images |
 | `npxc clean <pkg-spec>` | Remove a specific cached image |
 | `npxc clean --all` | Remove all cached images |
-| `npxc inspect <pkg-spec>` | Print resolved config, image tag, mount plan, then exit |
-| `npxc doctor` | Check that all prerequisites are present |
+| `npxc inspect <pkg-spec>` | Print resolved config, image tag, env grant sheet, and mount plan |
+| `npxc doctor` | Check prerequisites and configure the container system |
 
 ### Flags
 
 ```
 --config <path>     Alternate config file (default: ~/.config/npxc/npxc.toml)
 --cwd <path>        Override the CWD scope (default: process working directory)
---no-isolate        Disable path scoping; mount CWD read-only instead (escape hatch, warns loudly)
+--no-isolate        Disable path scoping; mount CWD read-only instead (warns loudly)
 --log-level <lvl>   trace | debug | info | warn | error  (default: warn; to stderr only)
---dry-run           Resolve config and print the plan, then exit (does not build or run)
+--dry-run           Resolve config and print the plan, then exit
 ```
 
 ### Exit codes
@@ -190,8 +189,47 @@ uri_prefix      = ["file://"]
 ### Per-package config — `packages/<name>.toml`
 
 ```toml
-package = "@sylphx/pdf-reader-mcp"
-version = "0.4.2"         # pinned; "latest" is allowed but discouraged
+package = "@scope/my-mcp-server"
+version = "1.2.3"         # pinned; "latest" is allowed but discouraged
+
+# ── Environment ───────────────────────────────────────────────────────────────
+
+# Literal values injected as environment variables (non-secret config).
+[env]
+NODE_OPTIONS = "--max-old-space-size=512"
+
+# Names of host env vars forwarded into the container.
+# Only the *name* lives in config — the value is read from npxc's own
+# environment at launch time and is never written to disk.
+# The container sees only the variables you list here, not the full host env.
+env_passthrough = ["OPENAI_API_KEY", "GITHUB_TOKEN"]
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+
+# Mount a per-package persistent host directory read-write at /data.
+# The host directory is created at:
+#   ~/Library/Application Support/npxc/packages/<sanitized-name>/   (macOS)
+# Use this for servers that need to maintain state across sessions
+# (e.g. server-memory, SQLite-backed servers).
+[storage]
+persist = true
+
+# ── Mounts ────────────────────────────────────────────────────────────────────
+
+# Extra filesystem mounts beyond the session workspace.
+# Host paths are validated to lie within the CWD scope (same rules as per-file
+# publication). Relative paths are resolved against the effective CWD.
+[[mounts]]
+host      = "."              # "." = the CWD itself
+container = "/project"
+mode      = "ro"             # "ro" (default) | "rw"
+
+[[mounts]]
+host      = "config"         # relative: resolves to <cwd>/config
+container = "/app/config"
+mode      = "ro"
+
+# ── Path identification ───────────────────────────────────────────────────────
 
 # Declare which arguments are filesystem paths, keyed by tool name.
 # "*" applies to all tools.
@@ -204,9 +242,28 @@ version = "0.4.2"         # pinned; "latest" is allowed but discouraged
 [non_path_arguments]
 "*" = ["url", "query", "pattern"]
 
-# Optional per-package resource overrides.
+# ── Runtime overrides ─────────────────────────────────────────────────────────
+
 [runtime]
-memory = "1g"
+memory  = "1g"
+network = "none"
+```
+
+### Inspecting the resolved plan
+
+`npxc inspect <pkg-spec>` prints everything that will be passed to the
+container at launch — useful for auditing before running:
+
+```
+package:         @scope/my-mcp-server
+version:         1.2.3
+image_tag:       npxc/scope-my-mcp-server:1.2.3
+network:         none
+memory:          1g
+env:             ["NODE_OPTIONS"]
+env_passthrough: ["OPENAI_API_KEY", "GITHUB_TOKEN"]
+storage:         persist → /data (rw)
+mount:           /Users/me/project → /project (ro)
 ```
 
 ---
@@ -221,13 +278,16 @@ memory = "1g"
   `npm`/`npx` at runtime, and a non-root user (`USER node:node`).
 - **Broad filesystem access.** The container's `/workspace` is populated
   dynamically: only files explicitly named in MCP tool calls (and only if they
-  resolve within the host CWD) are ever visible to the package. The mount is
-  read-only, so a package cannot write back through the published hard links to
-  the host originals. (This is the *default*; `--no-isolate` instead mounts the
-  whole CWD read-only.)
-- **Network exfiltration.** `--network none` removes all network interfaces
-  (verified: outbound connections fail with `ENETUNREACH`).
-- **Persistence.** Containers are ephemeral (`--rm`). Nothing survives session end.
+  resolve within the host CWD) are ever visible to the package. Any additional
+  mounts must be declared explicitly in the package config and are validated
+  within the same CWD scope.
+- **Credential theft.** The container inherits no host environment by default.
+  `env_passthrough` variables are opt-in per package and per name; the full host
+  environment is never exposed.
+- **Network exfiltration.** `--network none` removes all network interfaces.
+- **Persistence.** Containers are ephemeral (`--rm`). The only state that
+  survives a session is data written to an explicit `[storage] persist = true`
+  mount.
 
 > The filesystem boundary is the container mount, not the path heuristics: a
 > file that `npxc` fails to identify as a path is simply never published, so it
@@ -241,118 +301,33 @@ memory = "1g"
 - **LLM-driven enumeration.** An LLM that calls a tool repeatedly to read many
   files under CWD is a behavioral problem outside the proxy's scope.
 - **Container / VM escape.** `npxc` trusts Apple `container`'s isolation boundary.
-- **TOCTOU on published files.** The window between `canonicalize` and the hard
-  link is not defended (requires a local attacker with write access).
+- **Network misuse when enabled.** Tools that legitimately need the network
+  (`network = "bridge"`) can misuse the connection they were granted.
 
----
+### npm supply-chain attacks and this sandbox
 
-## Case studies: recent npm supply-chain attacks
+Most npm supply-chain attacks follow the same pattern: a compromised package
+reads host secrets and environment variables, then exfiltrates them over the
+network or persists them somewhere on the host. `npxc` removes the capabilities
+each stage depends on.
 
-Nearly every npm supply-chain attack follows the same kill chain: an attacker
-compromises a maintainer account (usually by phishing) or a CI token, ships
-malicious code inside an otherwise-normal package, and then — at **install**
-time or at **runtime** — (1) reads host secrets and files, (2) exfiltrates them
-over the network, and (3) persists or self-propagates.
+| Incident | Kill-chain stage blocked |
+|---|---|
+| **Qix maintainer phish** (chalk, debug, ~18 packages, Sep 2025) | No host env or network at runtime — payload has nowhere to send stolen data |
+| **"Shai-Hulud" worm** (`@ctrl/tinycolor`, ~500 packages, Sep 2025) | No `~/.npmrc`, no host env, no network — credential sweep finds nothing; self-propagation step cannot run |
+| **Nx "s1ngularity"** (Aug 2025) | No host filesystem, no host env, no host binaries — harvest targets unreachable; `~/.bashrc` persistence/DoS cannot touch the host |
+| **`postmark-mcp`** (Sep 2025) | Default `--network none` prevents silent exfiltration; network is opt-in per package |
+| **`@solana/web3.js`** (Dec 2024) | Private key read blocked — no host filesystem, no host env |
+| **`ua-parser-js`** (2021) | No network → no mining pool; no host files → no credential stealer |
+| **`node-ipc` protestware** (2022) | Read-only in-CWD mounts only — nothing to overwrite |
+| **`event-stream`** (2018) | No host filesystem, no network — data and exfiltration path both missing |
 
-`npxc` removes the capabilities each stage of that chain depends on. It moves
-`npm install` into an **ephemeral, isolated build VM** (so install scripts never
-touch your host filesystem, environment, or credentials), and it runs the server
-with **no network, no host environment variables, no host filesystem** (only
-explicitly-named in-CWD files, read-only), a **read-only root**, **all
-capabilities dropped**, and as a **non-root** user. The notes below describe how
-that posture maps onto specific, real incidents.
-
-> **Honest scoping.** `npxc` is strongest for the large class of MCP servers
-> that do *local* work (parsing, file analysis, format conversion), which should
-> run with the default `--network none`. Tools that inherently need the network
-> (sending email, calling an API) must opt into `network = "bridge"`, and `npxc`
-> cannot stop a tool from misusing the network it was *legitimately granted* —
-> it still contains filesystem, credential, and host damage, but covert
-> exfiltration over an allowed connection is out of scope. Also note that the
-> `npm install` step runs in an isolated VM but *does* have network (it must, to
-> fetch the package); the protection there is that it is sandboxed away from your
-> host, not that it is offline.
-
-### chalk, debug, ansi-styles, … — "Qix" maintainer phished (Sep 8, 2025)
-
-The most-downloaded compromise to date: a phishing email (from the look-alike
-domain `npmjs.help`) tricked the prolific maintainer *Qix* into resetting 2FA,
-and the attacker published malicious versions of ~18 foundational packages
-— `chalk`, `debug`, `ansi-styles`, `strip-ansi`, `color-convert`, and more —
-with a combined ~2–3 billion weekly downloads. The payload was a browser-side
-crypto-clipper that hooked `window.ethereum`/`fetch`/`XMLHttpRequest` to swap
-wallet addresses in transactions.
-
-**How `npxc` helps:** this particular payload only activates in a browser, so it
-would lie dormant in a Node MCP server. More generally, though, the lesson is
-that *any* dependency can be silently replaced — and had the same maintainer
-compromise shipped a Node-side stealer (the usual case below), `npxc`'s
-no-network, no-host-secrets sandbox would have left it nothing to steal and
-nowhere to send it.
-
-### "Shai-Hulud" worm — `@ctrl/tinycolor` + ~500 packages (Sep 2025)
-
-A self-replicating worm: on install, the payload downloaded TruffleHog, scanned
-the filesystem and environment for secrets (`NPM_TOKEN`, `GITHUB_TOKEN`,
-`AWS_ACCESS_KEY_ID`, …), probed cloud-metadata endpoints (`169.254.169.254`),
-validated the stolen npm token, then used it to **trojanize and republish other
-packages the victim owned** — propagating automatically — and exfiltrated
-findings to a webhook and to attacker-created public GitHub repositories.
-
-**How `npxc` helps:** the worm's entire premise is harvesting host/CI
-credentials and republishing with a stolen token. Under `npxc` the install runs
-in a throwaway VM with **no `~/.npmrc`, no host environment, no `~/.ssh`, no host
-cloud role**, so the credential sweep comes up empty; and the runtime server has
-**no network and no npm token**, so the self-propagation step (which must read a
-token and publish over the network) simply cannot run.
-
-### Nx "s1ngularity" — AI-assisted secret theft (Aug 26, 2025)
-
-A leaked CI publish token was used to ship malicious `nx` versions whose
-postinstall script harvested GitHub/npm tokens, SSH keys, `.env` files, and
-crypto wallets — even abusing locally-installed AI CLIs (`claude`, `gemini`,
-`q`) to enumerate sensitive files — then exfiltrated everything to public
-`s1ngularity-repository` repos under the victim's account. It also appended
-`sudo shutdown -h 0` to `~/.bashrc`/`~/.zshrc`, bricking interactive shells.
-
-**How `npxc` helps:** every target is on the *host* — `~/.npmrc`, `~/.ssh`,
-`.env`, wallet files, the host's AI CLIs, and the host shell RC files. The
-sandbox exposes none of them: no host filesystem, no host environment, no host
-binaries, and a read-only mount, so the harvest finds nothing and the
-shell-RC persistence/DoS can't touch the host. With no network at runtime, the
-exfiltration to GitHub also fails.
-
-### `postmark-mcp` — a malicious **MCP server** (Sep 2025)
-
-The most on-the-nose example for `npxc`: a trojanized npm package that posed as a
-Postmark email MCP server and silently **BCC'd every email it sent to an
-attacker-controlled address**. Because it was an MCP server, it ran with whatever
-trust the host gave it and exfiltrated mail in the normal flow of doing its job.
-
-**How `npxc` helps (and its limit):** most MCP servers do local work and should
-run with the default `--network none`, which turns "silently exfiltrates" into
-"cannot reach any network at all." An email sender, however, genuinely needs the
-network, so you would run it with `network = "bridge"` — and there `npxc` cannot
-stop a BCC over the connection the tool was granted. What it still buys you: the
-network is **off by default and opt-in per package**, and even when enabled the
-server has no access to your host filesystem, credentials, or other tools'
-data — so the blast radius is confined to the one capability you deliberately
-granted.
-
-### Earlier incidents, same shape
-
-- **`@solana/web3.js` (Dec 2024)** — a phished maintainer pushed versions
-  `1.95.6`/`1.95.7` that stole private keys to drain wallets. A key read and
-  shipped to the attacker is exactly what the no-network sandbox blocks.
-- **`ua-parser-js` (2021)** — account hijack delivered a cryptominer and a
-  credential stealer. No network → no mining pool and no exfiltration; CPU caps
-  and an ephemeral container limit the rest.
-- **`node-ipc` "protestware" (2022)** — wiped/overwrote files for users in
-  certain countries, geolocated by IP. With only read-only, in-CWD files
-  visible, there is nothing for it to destroy.
-- **`event-stream` (2018)** — a malicious transitive dependency targeted a
-  specific wallet app's funds. Scoping plus no network removes both the data and
-  the exfiltration path.
+**Honest limits.** `npxc` is strongest for servers that do local work and run
+with the default `--network none`. Tools that genuinely need the network must
+opt in, and `npxc` cannot stop misuse of a connection that was legitimately
+granted. The `npm install` step runs in an isolated VM but does have network
+access (necessary to fetch the package); the protection there is isolation from
+the host, not being offline.
 
 ---
 

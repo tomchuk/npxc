@@ -25,6 +25,10 @@ fn base_config() -> EffectiveConfig {
         version: None,
         path_arguments: HashMap::new(),
         non_path_arguments: HashMap::new(),
+        env: HashMap::new(),
+        env_passthrough: Vec::new(),
+        storage: None,
+        mounts: Vec::new(),
     }
 }
 

@@ -44,6 +44,12 @@ pub struct GlobalOpts {
     /// Print plan and exit without executing
     #[arg(long, global = true)]
     pub dry_run: bool,
+
+    /// Accept (and ignore) the `-y`/`--yes` flag emitted by MCP client
+    /// configs written as `npx -y <pkg> …`.  When `npxc` is used as a
+    /// drop-in replacement, clap would otherwise reject the leading flag.
+    #[arg(short = 'y', long = "yes", global = true, hide = true)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Subcommand)]

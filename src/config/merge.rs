@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use super::{global::NpxcConfig, package::PackageConfig};
+use super::{
+    global::NpxcConfig,
+    package::{MountConfig, PackageConfig, StorageConfig},
+};
 
 /// The fully-resolved, ready-to-use configuration for a single invocation.
 ///
@@ -31,6 +34,18 @@ pub struct EffectiveConfig {
     pub path_arguments: HashMap<String, Vec<String>>,
     /// Tool → non-path-argument names mapping from the package config.
     pub non_path_arguments: HashMap<String, Vec<String>>,
+
+    /// Literal environment variables to inject into the container (`-e K=V`).
+    pub env: HashMap<String, String>,
+    /// Names of environment variables to forward from npxc's process env
+    /// into the container (`-e K`).
+    pub env_passthrough: Vec<String>,
+
+    /// Persistent and writable storage options from the package config.
+    pub storage: Option<StorageConfig>,
+
+    /// Extra filesystem mounts from the package config.
+    pub mounts: Vec<MountConfig>,
 }
 
 /// Merge a global config with optional per-package overrides into a single
@@ -55,14 +70,27 @@ pub fn merge(global: &NpxcConfig, pkg: Option<&PackageConfig>) -> EffectiveConfi
     };
 
     // Pull per-package fields (defaults are empty/None when no config exists).
-    let (version, path_arguments, non_path_arguments) = match pkg {
-        Some(c) => (
-            c.version.clone(),
-            c.path_arguments.clone(),
-            c.non_path_arguments.clone(),
-        ),
-        None => (None, HashMap::new(), HashMap::new()),
-    };
+    let (version, path_arguments, non_path_arguments, env, env_passthrough, storage, mounts) =
+        match pkg {
+            Some(c) => (
+                c.version.clone(),
+                c.path_arguments.clone(),
+                c.non_path_arguments.clone(),
+                c.env.clone(),
+                c.env_passthrough.clone(),
+                c.storage.clone(),
+                c.mounts.clone(),
+            ),
+            None => (
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+            ),
+        };
 
     EffectiveConfig {
         node_image: d.node_image.clone(),
@@ -79,5 +107,9 @@ pub fn merge(global: &NpxcConfig, pkg: Option<&PackageConfig>) -> EffectiveConfi
         version,
         path_arguments,
         non_path_arguments,
+        env,
+        env_passthrough,
+        storage,
+        mounts,
     }
 }
