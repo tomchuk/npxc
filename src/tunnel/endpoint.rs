@@ -14,9 +14,10 @@ use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::device::WgDevice;
+use super::dns;
 use super::keys::WgKeypair;
 use super::peek;
 use super::policy::{Decision, Policy};
@@ -26,8 +27,14 @@ use crate::error::NpxcError;
 /// Guest-side tunnel MTU. Must match the `wg0` MTU configured in the guest.
 pub const MTU: u16 = 1380;
 
-/// Tunnel-internal address assigned to the guest's `wg0` interface.
+/// Tunnel-internal IPv4 address assigned to the guest's `wg0` interface.
 const GUEST_WG_ADDRESS: &str = "10.7.0.2/32";
+
+/// Tunnel-internal IPv6 address assigned to the guest's `wg0` interface (a ULA
+/// host route). Lets the guest source v6 packets into the tunnel so npxc can
+/// forward v6 egress; the address itself is link-local to the tunnel and never
+/// appears on the wire to the internet (npxc NATs via the host's real v6).
+const GUEST_WG_ADDRESS6: &str = "fd07::2/128";
 
 /// Resolver the guest is pointed at. Reached through the tunnel (the guest's
 /// default route is `wg0`), so DNS is forwarded by npxc regardless of the
@@ -42,6 +49,15 @@ const HTTP_PORT: u16 = 80;
 /// Well-known port for HTTPS, where the destination host is read from the TLS
 /// `ClientHello` SNI.
 const HTTPS_PORT: u16 = 443;
+
+/// UDP/443 carries QUIC (HTTP/3). We can't yet peek its SNI (it's inside the
+/// encrypted QUIC Initial), so it is blocked outright; clients fall back to
+/// TLS-over-TCP, which we do filter.
+const QUIC_PORT: u16 = 443;
+
+/// Standard DNS port. Guest queries to the pinned resolver on this port are
+/// answered by npxc's in-tunnel filtering resolver ([`dns`]).
+const DNS_PORT: u16 = 53;
 
 /// Per-UDP-flow relay buffer size.
 const UDP_BUF: usize = 2048;
@@ -134,6 +150,10 @@ fn guest_env(
         ("NPXC_WG_PEER_PUBLIC_KEY".to_string(), npxc.public_base64()),
         ("NPXC_WG_ENDPOINT".to_string(), format!("{gateway}:{port}")),
         ("NPXC_WG_ADDRESS".to_string(), GUEST_WG_ADDRESS.to_string()),
+        (
+            "NPXC_WG_ADDRESS6".to_string(),
+            GUEST_WG_ADDRESS6.to_string(),
+        ),
         ("NPXC_WG_MTU".to_string(), MTU.to_string()),
     ]
 }
@@ -186,6 +206,20 @@ impl Drop for Tunnel {
     }
 }
 
+/// Emit a structured egress audit event for one flow decision.
+///
+/// Allowed flows log at `info`, denied flows at `warn`, both under the
+/// `npxc::egress` target so an operator can collect the egress decision stream
+/// independently of the rest of npxc's logging (e.g. `NPXC_LOG=npxc::egress=info`).
+/// `host` is the peeked SNI/`Host` when known, `-` otherwise.
+fn audit(proto: &str, dest: SocketAddr, hostname: Option<&str>, decision: Decision) {
+    let host = hostname.unwrap_or("-");
+    match decision {
+        Decision::Allow => info!(target: "npxc::egress", proto, %dest, host, "allow"),
+        Decision::Deny => warn!(target: "npxc::egress", proto, %dest, host, "deny"),
+    }
+}
+
 /// Forward a guest TCP connection to its real destination if the policy allows.
 ///
 /// For HTTPS/HTTP the destination hostname is peeked (TLS SNI / HTTP `Host`)
@@ -204,8 +238,9 @@ async fn forward_tcp(mut guest: IpStackTcpStream, policy: Arc<Policy>) {
         _ => None,
     };
 
-    if policy.evaluate(dest.ip(), dest.port(), hostname.as_deref()) == Decision::Deny {
-        debug!(%dest, ?hostname, "egress denied (tcp)");
+    let decision = policy.evaluate(dest.ip(), dest.port(), hostname.as_deref());
+    audit("tcp", dest, hostname.as_deref(), decision);
+    if decision == Decision::Deny {
         return;
     }
 
@@ -235,10 +270,27 @@ async fn forward_tcp(mut guest: IpStackTcpStream, policy: Arc<Policy>) {
 /// IP/port alone (DNS to the pinned resolver is implicitly permitted).
 async fn forward_udp(mut guest: IpStackUdpStream, policy: Arc<Policy>) {
     let dest = guest.peer_addr();
-    if policy.evaluate(dest.ip(), dest.port(), None) == Decision::Deny {
-        debug!(%dest, "egress denied (udp)");
+
+    // Block QUIC: it can't be SNI-filtered yet, so deny UDP/443 unconditionally
+    // and let the client fall back to TLS-over-TCP (which we do filter).
+    if dest.port() == QUIC_PORT {
+        warn!(target: "npxc::egress", proto = "udp", %dest, host = "-", "deny: udp/443 (quic) blocked");
         return;
     }
+
+    // DNS pinning: answer queries to the pinned resolver ourselves, returning
+    // records only for allowlisted names (NXDOMAIN otherwise).
+    if dest.ip() == policy.dns_resolver() && dest.port() == DNS_PORT {
+        dns::serve(guest, dest, policy).await;
+        return;
+    }
+
+    let decision = policy.evaluate(dest.ip(), dest.port(), None);
+    audit("udp", dest, None, decision);
+    if decision == Decision::Deny {
+        return;
+    }
+
     let bind: SocketAddr = if dest.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
@@ -288,6 +340,7 @@ mod tests {
         assert_eq!(map["NPXC_WG_PEER_PUBLIC_KEY"], npxc.public_base64());
         assert_eq!(map["NPXC_WG_ENDPOINT"], "192.168.66.1:51820");
         assert_eq!(map["NPXC_WG_ADDRESS"], GUEST_WG_ADDRESS);
+        assert_eq!(map["NPXC_WG_ADDRESS6"], GUEST_WG_ADDRESS6);
         assert_eq!(map["NPXC_WG_MTU"], MTU.to_string());
         // The guest gets its own private key and npxc's public key — never the
         // reverse, so npxc's secret stays on the host.
@@ -300,6 +353,18 @@ mod tests {
             panic!("ipv4 only");
         };
         let builder = etherparse::PacketBuilder::ipv4(sip.octets(), dip.octets(), 64)
+            .udp(src.port(), dst.port());
+        let mut out = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut out, payload).unwrap();
+        out
+    }
+
+    /// Build a valid IPv6 + UDP packet with correct checksums.
+    fn ipv6_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let (IpAddr::V6(sip), IpAddr::V6(dip)) = (src.ip(), dst.ip()) else {
+            panic!("ipv6 only");
+        };
+        let builder = etherparse::PacketBuilder::ipv6(sip.octets(), dip.octets(), 64)
             .udp(src.port(), dst.port());
         let mut out = Vec::with_capacity(builder.size(payload.len()));
         builder.write(&mut out, payload).unwrap();
@@ -371,6 +436,77 @@ mod tests {
                     udp.peer_addr(),
                     dest,
                     "surfaced stream must target the packet's destination",
+                );
+            }
+            _ => panic!("expected a UDP stream"),
+        }
+
+        guest.await.unwrap();
+    }
+
+    /// The same end-to-end receive path, but with an **IPv6** inner packet. The
+    /// outer `WireGuard` transport is still IPv4 (as over vmnet); only the
+    /// tunneled payload is v6. Proves npxc's datapath carries v6 egress — the
+    /// decrypted v6 packet must surface as an `ipstack` stream addressed to the
+    /// v6 destination.
+    #[tokio::test]
+    async fn loopback_ipv6_udp_flow_surfaces_v6_stream() {
+        let npxc_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let npxc_addr = npxc_sock.local_addr().unwrap();
+        let npxc_kp = WgKeypair::generate();
+        let guest_kp = WgKeypair::generate();
+        let npxc_tunnel = WgTunnel::new(npxc_kp.secret(), guest_kp.public(), 1);
+        let device = WgDevice::new(npxc_sock, npxc_tunnel);
+
+        let mut config = IpStackConfig::default();
+        let _ = config.mtu(MTU);
+        let mut ip_stack = IpStack::new(config, device);
+
+        let guest_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        guest_sock.connect(npxc_addr).await.unwrap();
+        let mut guest_tunnel = WgTunnel::new(guest_kp.secret(), npxc_kp.public(), 2);
+
+        let guest_src: SocketAddr = (Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 2), 40000).into();
+        let dest: SocketAddr = (
+            Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+            5353,
+        )
+            .into();
+        let packet = ipv6_udp_packet(guest_src, dest, b"hello6");
+
+        let guest = tokio::spawn(async move {
+            let mut init = Vec::new();
+            guest_tunnel.encapsulate(&packet, |b| init.extend_from_slice(b));
+            guest_sock.send(&init).await.unwrap();
+
+            let mut buf = [0u8; 2048];
+            let n = guest_sock.recv(&mut buf).await.unwrap();
+            let mut flushed = Vec::new();
+            guest_tunnel.decapsulate(&buf[..n], |b| flushed.extend_from_slice(b), |_| {});
+            if !flushed.is_empty() {
+                guest_sock.send(&flushed).await.unwrap();
+            }
+
+            let mut data = Vec::new();
+            guest_tunnel.encapsulate(&packet, |b| data.extend_from_slice(b));
+            if !data.is_empty() {
+                guest_sock.send(&data).await.unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let stream = tokio::time::timeout(Duration::from_secs(5), ip_stack.accept())
+            .await
+            .expect("timed out waiting for ipstack to surface a v6 stream")
+            .expect("ipstack accept error");
+
+        match stream {
+            IpStackStream::Udp(udp) => {
+                assert_eq!(
+                    udp.peer_addr(),
+                    dest,
+                    "surfaced stream must target the v6 packet's destination",
                 );
             }
             _ => panic!("expected a UDP stream"),

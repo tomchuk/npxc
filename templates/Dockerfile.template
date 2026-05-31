@@ -37,10 +37,12 @@ const lines = [
   "  boringtun-cli --disable-drop-privileges wg0 >&2",
   '  i=0; while [ ! -S /run/wireguard/wg0.sock ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done',
   `  printf '%s' "$NPXC_WG_PRIVATE_KEY" | wg set wg0 private-key /dev/stdin`,
-  '  wg set wg0 peer "$NPXC_WG_PEER_PUBLIC_KEY" endpoint "$NPXC_WG_ENDPOINT" allowed-ips 0.0.0.0/0 persistent-keepalive 25',
+  '  wg set wg0 peer "$NPXC_WG_PEER_PUBLIC_KEY" endpoint "$NPXC_WG_ENDPOINT" allowed-ips 0.0.0.0/0,::/0 persistent-keepalive 25',
   '  ip address add "$NPXC_WG_ADDRESS" dev wg0',
+  '  if [ -n "$NPXC_WG_ADDRESS6" ]; then ip -6 address add "$NPXC_WG_ADDRESS6" dev wg0 || true; fi',
   '  ip link set wg0 mtu "${NPXC_WG_MTU:-1380}" up',
   "  ip route replace default dev wg0",
+  '  if [ -n "$NPXC_WG_ADDRESS6" ]; then ip -6 route replace default dev wg0 || true; fi',
   "fi",
   `exec setpriv --reuid 1000 --regid 1000 --clear-groups node ${abs} "$@"`,
 ];

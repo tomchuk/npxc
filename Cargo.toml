@@ -63,6 +63,9 @@ getrandom = "0.4.2"
 ipstack = "1.0.0"
 ipnet = "2"
 tls-parser = "0.12"
+# DNS message parse/build only (in-tunnel allowlist resolver). No runtime/TLS.
+# Pinned to 0.25 to stay within npxc's MSRV (0.26 requires Rust 1.88).
+hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 assert_cmd         = "2"

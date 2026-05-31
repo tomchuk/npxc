@@ -7,11 +7,15 @@
 //!
 //! 1. an **allowed** destination (by IP/port) is reachable, a **denied** one is
 //!    not;
-//! 2. an **allowed** TLS SNI on 443 connects while a **denied** SNI is reset —
+//! 2. an **allowed** TLS SNI on 443 connects while a **denied** name does not —
 //!    the headline filtering feature;
-//! 3. tearing down `wg0` inside the guest yields **no** internet at all (the
+//! 3. an **allowlisted** name resolves through npxc's in-tunnel resolver while a
+//!    non-allowlisted name returns `NXDOMAIN` (DNS pinning);
+//! 4. tearing down `wg0` inside the guest yields **no** internet at all (the
 //!    unbypassable-floor / bypass test): the `--internal` network has no NAT, so
-//!    removing the tunnel removes egress entirely.
+//!    removing the tunnel removes egress entirely;
+//! 5. an allowlisted name reached over **IPv6** completes its TLS handshake
+//!    through the tunnel (run only when the host itself has IPv6 egress).
 //!
 //! It requires the same environment as `e2e_runtime.rs`:
 //!
@@ -31,16 +35,20 @@
 
 #![cfg(feature = "e2e")]
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;
+use std::time::Duration;
 
 use npxc::config::NetworkPolicy;
 use npxc::runtime::ManagedNetwork;
 use npxc::tunnel;
+use tokio::net::TcpStream;
 use tokio::process::Command;
+use tokio::time::timeout;
 
-/// Tag for the probe image built (once) by this suite.
-const PROBE_IMAGE: &str = "npxc-e2e-probe:latest";
+/// Tag for the probe image built (once) by this suite. Bump the version suffix
+/// whenever [`PROBE_DOCKERFILE`] changes so a stale cached image is rebuilt.
+const PROBE_IMAGE: &str = "npxc-e2e-probe:2";
 
 /// Probe-image Dockerfile: the same userspace-WireGuard tooling as npxc's
 /// runtime image (boringtun-cli + `wg`/`ip`), but with a generic `/bin/sh -c`
@@ -63,10 +71,12 @@ mkdir -p /run/wireguard
 boringtun-cli --disable-drop-privileges wg0 >&2
 i=0; while [ ! -S /run/wireguard/wg0.sock ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 printf '%s' "$NPXC_WG_PRIVATE_KEY" | wg set wg0 private-key /dev/stdin
-wg set wg0 peer "$NPXC_WG_PEER_PUBLIC_KEY" endpoint "$NPXC_WG_ENDPOINT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+wg set wg0 peer "$NPXC_WG_PEER_PUBLIC_KEY" endpoint "$NPXC_WG_ENDPOINT" allowed-ips 0.0.0.0/0,::/0 persistent-keepalive 25
 ip address add "$NPXC_WG_ADDRESS" dev wg0
+if [ -n "$NPXC_WG_ADDRESS6" ]; then ip -6 address add "$NPXC_WG_ADDRESS6" dev wg0 || true; fi
 ip link set wg0 mtu "${NPXC_WG_MTU:-1380}" up
 ip route replace default dev wg0
+if [ -n "$NPXC_WG_ADDRESS6" ]; then ip -6 route replace default dev wg0 || true; fi
 EOF
 RUN chmod +x /wg-up.sh
 ENTRYPOINT ["/bin/sh", "-c"]
@@ -106,6 +116,28 @@ s.on("timeout",()=>{console.log(tag,"TLS_TIMEOUT");s.destroy();r()})})}
 (async()=>{await t("example.com","ALLOWED");await t("example.org","DENIED");process.exit(0)})()'
 "#;
 
+/// Scenario 4: DNS pinning. A query for an allowlisted name must resolve, while
+/// a query for any other name must come back `NXDOMAIN` (node reports
+/// `ENOTFOUND`) — npxc answers DNS itself, scoped to the allowlist.
+const PROBE_DNS: &str = r#"/wg-up.sh >&2 || { echo WG_SETUP_FAILED; exit 0; }
+node -e 'const dns=require("dns");
+function t(name,tag){return new Promise(r=>{dns.lookup(name,{family:4},(e,addr)=>{
+  console.log(tag, e?("NXDOMAIN "+e.code):("RESOLVED "+addr)); r()})})}
+(async()=>{await t("example.com","ALLOWED");await t("denied.example.org","DENIED");process.exit(0)})()'
+"#;
+
+/// Scenario 5: IPv6 egress. A TLS handshake to an allowlisted name forced over
+/// IPv6 must complete — the name's AAAA resolves through the pinned resolver and
+/// the v6 flow is carried by the tunnel and SNI-filtered like its v4 twin. Only
+/// run when the host itself has IPv6 egress (see [`host_has_ipv6`]).
+const PROBE_V6: &str = r#"/wg-up.sh >&2 || { echo WG_SETUP_FAILED; exit 0; }
+node -e 'const tls=require("tls");
+const s=tls.connect({host:"example.com",servername:"example.com",port:443,family:6,rejectUnauthorized:false},()=>{console.log("V6 TLS_OK");s.destroy();process.exit(0)});
+s.setTimeout(12000);
+s.on("error",e=>{console.log("V6 TLS_ERR",e.code||"err");process.exit(0)});
+s.on("timeout",()=>{console.log("V6 TLS_TIMEOUT");process.exit(0)})'
+"#;
+
 /// Scenario 3 (bypass): even with an allow rule that would permit the flow,
 /// tearing down `wg0` must leave the guest with no internet — the host-only
 /// network has no NAT route, so the tunnel is the only way out.
@@ -121,6 +153,21 @@ s.on("timeout",()=>{console.log("BYPASS_BLOCKED_TIMEOUT");process.exit(0)})'
 /// Resolve the container CLI, honouring `NPXC_CONTAINER_CLI`.
 fn container_cli() -> String {
     std::env::var("NPXC_CONTAINER_CLI").unwrap_or_else(|_| "container".to_string())
+}
+
+/// Whether the host itself has working IPv6 egress. The v6 scenario is only
+/// meaningful (and only able to pass) when npxc can reach v6 destinations.
+async fn host_has_ipv6() -> bool {
+    // Cloudflare's public v6 resolver, TCP/443.
+    let addr: SocketAddr = (
+        std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+        443,
+    )
+        .into();
+    matches!(
+        timeout(Duration::from_secs(4), TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Ensure the probe image exists, building it once if necessary.
@@ -230,6 +277,7 @@ async fn run_scenario(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // a sequence of independent, self-documenting scenarios
 async fn allowlist_is_enforced_end_to_end() {
     let cli = container_cli();
     if !ensure_probe_image(&cli).await {
@@ -259,7 +307,11 @@ async fn allowlist_is_enforced_end_to_end() {
         return;
     };
 
-    let scenarios = [
+    // The v6 scenario only runs (and can only pass) when the host has IPv6
+    // egress; otherwise it's skipped so the suite stays green on v4-only hosts.
+    let host_v6 = host_has_ipv6().await;
+
+    let mut scenarios = vec![
         ("ip-allow-deny", vec!["1.1.1.1:80".to_string()], PROBE_IP),
         (
             "sni-allow-deny",
@@ -267,13 +319,23 @@ async fn allowlist_is_enforced_end_to_end() {
             PROBE_SNI,
         ),
         (
+            "dns-pinning",
+            vec!["example.com:443".to_string()],
+            PROBE_DNS,
+        ),
+        (
             "wg0-teardown-bypass",
             vec!["1.1.1.1:80".to_string()],
             PROBE_BYPASS,
         ),
     ];
+    if host_v6 {
+        scenarios.push(("ipv6-egress", vec!["example.com:443".to_string()], PROBE_V6));
+    } else {
+        eprintln!("note: host has no IPv6 egress; skipping the ipv6-egress scenario");
+    }
 
-    let mut results = Vec::new();
+    let mut results: Vec<(&str, String)> = Vec::new();
     for (label, allow, script) in scenarios {
         if let Some(out) = run_scenario(&cli, &net_name, gateway, allow, script).await {
             results.push((label, out));
@@ -290,9 +352,16 @@ async fn allowlist_is_enforced_end_to_end() {
     for (label, out) in &results {
         eprintln!("=== scenario: {label} ===\n{out}");
     }
+    let out = |label: &str| -> &str {
+        &results
+            .iter()
+            .find(|(l, _)| *l == label)
+            .expect("scenario was run")
+            .1
+    };
 
-    // ── Scenario 1: IP/port allowlist ────────────────────────────────────────
-    let ip = &results[0].1;
+    // ── IP/port allowlist ────────────────────────────────────────────────
+    let ip = out("ip-allow-deny");
     assert!(
         ip.contains("ALLOWED RESPONSE"),
         "allowed IP 1.1.1.1:80 should return an HTTP response through the tunnel; got:\n{ip}"
@@ -302,19 +371,34 @@ async fn allowlist_is_enforced_end_to_end() {
         "denied IP 1.0.0.1:80 must exchange no data (reset); got:\n{ip}"
     );
 
-    // ── Scenario 2: SNI allowlist on 443 ─────────────────────────────────────
-    let sni = &results[1].1;
+    // ── SNI allowlist on 443 ──────────────────────────────────────────
+    let sni = out("sni-allow-deny");
     assert!(
         sni.contains("ALLOWED TLS_OK"),
         "allowed SNI example.com:443 should complete its TLS handshake; got:\n{sni}"
     );
     assert!(
         !sni.contains("DENIED TLS_OK"),
-        "denied SNI example.org:443 must be reset before the handshake completes; got:\n{sni}"
+        "denied name must not complete a TLS handshake (blocked at DNS or by SNI reset); got:\n{sni}"
     );
 
-    // ── Scenario 3: bypass (wg0 torn down) ───────────────────────────────────
-    let bypass = &results[2].1;
+    // ── DNS pinning ─────────────────────────────────────────────────────
+    let dns = out("dns-pinning");
+    assert!(
+        dns.contains("ALLOWED RESOLVED"),
+        "an allowlisted name must resolve through the in-tunnel resolver; got:\n{dns}"
+    );
+    assert!(
+        dns.contains("DENIED NXDOMAIN"),
+        "a non-allowlisted name must return NXDOMAIN; got:\n{dns}"
+    );
+    assert!(
+        !dns.contains("DENIED RESOLVED"),
+        "a non-allowlisted name must NOT resolve; got:\n{dns}"
+    );
+
+    // ── bypass (wg0 torn down) ──────────────────────────────────────────
+    let bypass = out("wg0-teardown-bypass");
     assert!(
         bypass.contains("BYPASS_BLOCKED"),
         "with wg0 torn down the host-only network must have no internet; got:\n{bypass}"
@@ -323,4 +407,13 @@ async fn allowlist_is_enforced_end_to_end() {
         !bypass.contains("BYPASS_CONNECT_OK"),
         "guest reached the internet without the tunnel — the floor is bypassable; got:\n{bypass}"
     );
+
+    // ── IPv6 egress (only when the host has v6) ──────────────────────────────
+    if host_v6 {
+        let v6 = out("ipv6-egress");
+        assert!(
+            v6.contains("V6 TLS_OK"),
+            "an allowlisted name over IPv6 should complete its TLS handshake; got:\n{v6}"
+        );
+    }
 }

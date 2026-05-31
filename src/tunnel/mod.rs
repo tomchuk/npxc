@@ -12,8 +12,10 @@
 //! - [`device`] — an `ipstack` packet device backed by the tunnel over UDP.
 //! - [`policy`] — the default-deny egress allowlist.
 //! - [`peek`] — connection-time TLS SNI / HTTP `Host` extraction.
+//! - [`dns`] — in-tunnel DNS pinning scoped to the allowlist.
 
 pub mod device;
+pub mod dns;
 pub mod endpoint;
 pub mod keys;
 pub mod peek;

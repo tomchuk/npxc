@@ -68,9 +68,13 @@ impl Rule {
 }
 
 /// A default-deny egress allowlist.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Policy {
     rules: Vec<Rule>,
+    /// The resolver npxc pinned in the guest's `resolv.conf`. DNS to this
+    /// address on port 53 is answered by npxc's in-tunnel filtering resolver
+    /// (see [`crate::tunnel::dns`]) rather than relayed.
+    dns_resolver: IpAddr,
 }
 
 impl Policy {
@@ -93,7 +97,10 @@ impl Policy {
             host: HostMatch::Net(host_net(dns_resolver)),
             port: PortMatch::Only(53),
         });
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            dns_resolver,
+        })
     }
 
     /// Decide whether a flow to `(ip, port)` — optionally carrying a peeked
@@ -105,6 +112,26 @@ impl Policy {
         } else {
             Decision::Deny
         }
+    }
+
+    /// Whether any domain rule in the allowlist covers `name`, ignoring ports.
+    ///
+    /// Used by the in-tunnel DNS resolver to decide which names to resolve:
+    /// names with a matching domain rule are resolved upstream, all others get
+    /// `NXDOMAIN`. `name` should be the bare hostname (no trailing dot).
+    #[must_use]
+    pub fn allows_name(&self, name: &str) -> bool {
+        self.rules.iter().any(|r| match &r.host {
+            HostMatch::Domain(d) => d.eq_ignore_ascii_case(name),
+            HostMatch::Net(_) => false,
+        })
+    }
+
+    /// The pinned DNS resolver address. Queries the guest sends here on port 53
+    /// are handled by npxc's filtering resolver.
+    #[must_use]
+    pub fn dns_resolver(&self) -> IpAddr {
+        self.dns_resolver
     }
 }
 
@@ -341,5 +368,29 @@ mod tests {
     #[test]
     fn validate_rejects_bad_entry() {
         assert!(validate(&["good.com:443".to_string(), "bad:port".to_string()]).is_err());
+    }
+
+    #[test]
+    fn allows_name_matches_domain_rules_case_insensitively() {
+        let p = policy(&["api.anthropic.com:443", "10.0.0.0/24:5432"]);
+        assert!(p.allows_name("api.anthropic.com"));
+        assert!(p.allows_name("API.Anthropic.com"));
+        // A name not covered by any domain rule.
+        assert!(!p.allows_name("evil.com"));
+        // IP/CIDR rules don't grant name resolution.
+        assert!(!p.allows_name("10.0.0.5"));
+    }
+
+    #[test]
+    fn allows_name_ignores_port() {
+        // The domain rule has a port, but name resolution is port-agnostic.
+        let p = policy(&["example.com:443"]);
+        assert!(p.allows_name("example.com"));
+    }
+
+    #[test]
+    fn dns_resolver_is_recorded() {
+        let p = policy(&[]);
+        assert_eq!(p.dns_resolver(), DNS);
     }
 }
