@@ -9,9 +9,14 @@
 //! Layers:
 //! - [`keys`] — `WireGuard` key material (`Curve25519` keypairs, base64 encoding).
 //! - [`wg`] — the `WireGuard` transport state machine over `boringtun`.
+//! - [`device`] — an `ipstack` packet device backed by the tunnel over UDP.
 
+pub mod device;
+pub mod endpoint;
 pub mod keys;
 pub mod wg;
 
+pub use device::WgDevice;
+pub use endpoint::Tunnel;
 pub use keys::WgKeypair;
 pub use wg::WgTunnel;

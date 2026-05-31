@@ -25,6 +25,7 @@ tokio              = { version = "1", features = [
     "io-util",
     "io-std",
     "fs",
+    "net",
     "sync",
     "signal",
     "time",
@@ -59,9 +60,11 @@ tempfile           = "3"
 boringtun = { version = "0.7", default-features = false }
 base64 = "0.22"
 getrandom = "0.4.2"
+ipstack = "1.0.0"
 
 [dev-dependencies]
 assert_cmd         = "2"
+etherparse = "0.19"
 predicates         = "3"
 
 [features]
