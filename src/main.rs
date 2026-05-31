@@ -7,10 +7,12 @@ use clap::Parser;
 
 use npxc::{
     cli::{Cli, Commands, GlobalOpts},
-    config,
+    config::{self, NetworkPolicy},
     error::NpxcError,
     rpc::pipeline,
-    runtime::{LaunchPlan, Session, ensure_image, image_tag, list_images, remove_image},
+    runtime::{
+        LaunchPlan, ManagedNetwork, Session, ensure_image, image_tag, list_images, remove_image,
+    },
 };
 
 // ── Entry-point ───────────────────────────────────────────────────────────────
@@ -77,6 +79,7 @@ async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcEr
         println!("package:    {pkg_name}");
         println!("version:    {version}");
         println!("image_tag:  {tag}");
+        println!("network:    {}", effective.network);
         println!("no_isolate: {}", global.no_isolate);
         println!("args:       {pkg_args:?}");
         return Ok(());
@@ -91,7 +94,23 @@ async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcEr
     }
 
     let plan = LaunchPlan::build(&pkg_name, &effective, &cwd, pkg_args, global.no_isolate)?;
-    let mut session = Session::start(&pkg_name, &tag, &effective, &plan, None)?;
+
+    // Provision the per-session network (creates an isolated `--internal`
+    // network for allowlist mode; a no-op otherwise) before launching.
+    let (network_arg, managed_network) =
+        ManagedNetwork::provision(&effective.network, &effective.container_cli).await?;
+
+    let mut session = match Session::start(&pkg_name, &tag, &effective, &network_arg, &plan, None) {
+        Ok(session) => session,
+        Err(e) => {
+            // The session never took ownership of the network; clean it up.
+            if let Some(net) = managed_network {
+                net.delete_blocking();
+            }
+            return Err(e);
+        }
+    };
+    session.attach_network(managed_network);
 
     tracing::info!(
         package = %pkg_name,
@@ -188,6 +207,11 @@ fn cmd_inspect(package_spec: &str, global: &GlobalOpts) -> Result<(), NpxcError>
     println!("container_cli: {}", effective.container_cli);
     println!("node_image:    {}", effective.node_image);
     println!("network:       {}", effective.network);
+    if let NetworkPolicy::Allowlist { allow } = &effective.network {
+        for entry in allow {
+            println!("  allow:       {entry}");
+        }
+    }
     println!("memory:        {}", effective.memory);
     println!("cpus:          {}", effective.cpus);
     println!("mount_mode:    {}", effective.mount_mode);

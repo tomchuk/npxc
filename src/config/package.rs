@@ -92,6 +92,13 @@ pub struct PackageConfig {
     /// (same rules as per-file publication).
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
+
+    /// Network / egress policy for the package.
+    ///
+    /// When present, this `[network]` table is authoritative for the
+    /// container's networking and takes precedence over the legacy
+    /// `[runtime] network` string.
+    pub network: Option<NetworkConfig>,
 }
 
 /// Per-package container-runtime resource overrides.  Any field left as
@@ -155,4 +162,34 @@ pub struct MountConfig {
 
 fn default_mount_mode() -> String {
     "ro".to_string()
+}
+
+/// Network / egress policy for a package.
+///
+/// Example in `packages/<name>.toml`:
+/// ```toml
+/// [network]
+/// mode  = "allowlist"        # "none" (default) | "open" | "allowlist"
+/// allow = ["api.anthropic.com:443"]
+/// ```
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Network mode:
+    /// - `"none"` — no network interface (the default).
+    /// - `"open"` — the built-in NAT network; unfiltered internet access.
+    /// - `"allowlist"` — a per-session host-only network whose egress is
+    ///   restricted to `allow`.
+    ///
+    /// Any other value is treated as a literal container network name.
+    #[serde(default = "default_network_mode")]
+    pub mode: String,
+
+    /// Egress allowlist entries (`host[:port]` or `cidr[:port]`), used when
+    /// `mode = "allowlist"`.  An empty list denies all egress.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+fn default_network_mode() -> String {
+    "none".to_string()
 }

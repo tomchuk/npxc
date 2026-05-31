@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use npxc::config::EffectiveConfig;
+use npxc::config::{EffectiveConfig, NetworkPolicy};
 use npxc::paths::identify::identify_path_args;
 use npxc::rpc::message::ToolSchema;
 use serde_json::{Map, Value, json};
@@ -13,7 +13,7 @@ fn base_config() -> EffectiveConfig {
     EffectiveConfig {
         node_image: String::new(),
         container_cli: String::new(),
-        network: String::new(),
+        network: NetworkPolicy::None,
         memory: String::new(),
         cpus: String::new(),
         mount_mode: String::new(),

@@ -1,9 +1,35 @@
 use std::collections::HashMap;
 
 use super::{
-    global::NpxcConfig,
+    global::{Defaults, NpxcConfig},
     package::{MountConfig, PackageConfig, StorageConfig},
 };
+
+/// Resolved network / egress policy for a single invocation.
+///
+/// Produced by [`merge`] from the package `[network]` table (authoritative
+/// when present) or the legacy `network` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    /// No network interface (`--network none`).
+    None,
+    /// A named container network passed to `--network` verbatim.
+    Named(String),
+    /// A per-session isolated host-only network with an egress allowlist.
+    Allowlist { allow: Vec<String> },
+}
+
+impl std::fmt::Display for NetworkPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkPolicy::None => write!(f, "none"),
+            NetworkPolicy::Named(name) => write!(f, "{name}"),
+            NetworkPolicy::Allowlist { allow } => {
+                write!(f, "allowlist ({} rule(s))", allow.len())
+            }
+        }
+    }
+}
 
 /// The fully-resolved, ready-to-use configuration for a single invocation.
 ///
@@ -15,7 +41,7 @@ pub struct EffectiveConfig {
     // ── Image / runtime ──────────────────────────────────────────────────────
     pub node_image: String,
     pub container_cli: String,
-    pub network: String,
+    pub network: NetworkPolicy,
     pub memory: String,
     pub cpus: String,
     pub mount_mode: String,
@@ -59,15 +85,16 @@ pub fn merge(global: &NpxcConfig, pkg: Option<&PackageConfig>) -> EffectiveConfi
     let d = &global.defaults;
     let p = &global.paths;
 
-    // Resolve memory / cpus / network: package runtime wins over global defaults.
-    let (network, memory, cpus) = match pkg.and_then(|c| c.runtime.as_ref()) {
+    // Resolve memory / cpus: package runtime wins over global defaults.
+    let (memory, cpus) = match pkg.and_then(|c| c.runtime.as_ref()) {
         Some(rt) => (
-            rt.network.clone().unwrap_or_else(|| d.network.clone()),
             rt.memory.clone().unwrap_or_else(|| d.memory.clone()),
             rt.cpus.clone().unwrap_or_else(|| d.cpus.clone()),
         ),
-        None => (d.network.clone(), d.memory.clone(), d.cpus.clone()),
+        None => (d.memory.clone(), d.cpus.clone()),
     };
+
+    let network = resolve_network_policy(pkg, d);
 
     // Pull per-package fields (defaults are empty/None when no config exists).
     let (version, path_arguments, non_path_arguments, env, env_passthrough, storage, mounts) =
@@ -111,5 +138,34 @@ pub fn merge(global: &NpxcConfig, pkg: Option<&PackageConfig>) -> EffectiveConfi
         env_passthrough,
         storage,
         mounts,
+    }
+}
+
+/// Resolve the network policy.
+///
+/// The package `[network]` table is authoritative when present; otherwise the
+/// legacy `[runtime] network` string (falling back to `[defaults] network`)
+/// is mapped: `"none"` → [`NetworkPolicy::None`], anything else → a named
+/// network.
+fn resolve_network_policy(pkg: Option<&PackageConfig>, d: &Defaults) -> NetworkPolicy {
+    if let Some(nc) = pkg.and_then(|c| c.network.as_ref()) {
+        return match nc.mode.as_str() {
+            "allowlist" => NetworkPolicy::Allowlist {
+                allow: nc.allow.clone(),
+            },
+            "open" => NetworkPolicy::Named("default".to_string()),
+            "none" => NetworkPolicy::None,
+            // Any other value is treated as a literal network name.
+            other => NetworkPolicy::Named(other.to_string()),
+        };
+    }
+
+    let legacy = pkg
+        .and_then(|c| c.runtime.as_ref())
+        .and_then(|r| r.network.clone())
+        .unwrap_or_else(|| d.network.clone());
+    match legacy.as_str() {
+        "none" => NetworkPolicy::None,
+        other => NetworkPolicy::Named(other.to_string()),
     }
 }

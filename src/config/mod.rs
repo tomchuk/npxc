@@ -3,7 +3,7 @@ pub mod merge;
 pub mod package;
 
 pub use global::NpxcConfig;
-pub use merge::EffectiveConfig;
+pub use merge::{EffectiveConfig, NetworkPolicy};
 pub use package::PackageConfig;
 
 use std::path::{Path, PathBuf};
@@ -365,11 +365,11 @@ fn validate_runtime(effective: &EffectiveConfig) -> Result<(), NpxcError> {
         }
     }
 
-    if !matches!(effective.network.as_str(), "none" | "bridge") {
+    if let NetworkPolicy::Named(name) = &effective.network {
         tracing::warn!(
-            network = %effective.network,
-            "non-standard network value; container isolation may be weakened \
-             (expected \"none\" or \"bridge\")"
+            network = %name,
+            "container attached to a named network; egress is unfiltered \
+             (use [network] mode = \"allowlist\" to restrict it)"
         );
     }
 
@@ -551,7 +551,7 @@ mod tests {
         let eff = merge::merge(&global, None);
         assert_eq!(eff.memory, "512m");
         assert_eq!(eff.cpus, "1");
-        assert_eq!(eff.network, "none");
+        assert_eq!(eff.network, NetworkPolicy::None);
         assert_eq!(eff.node_image, "node:lts-slim");
         assert!(eff.version.is_none());
         assert!(eff.path_arguments.is_empty());
@@ -573,8 +573,63 @@ mod tests {
         let eff = merge::merge(&global, Some(&pkg));
         assert_eq!(eff.memory, "2g");
         assert_eq!(eff.cpus, "1"); // falls back to global default
-        assert_eq!(eff.network, "bridge");
+        assert_eq!(eff.network, NetworkPolicy::Named("bridge".to_string()));
         assert_eq!(eff.version, Some("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn merge_network_table_allowlist_mode() {
+        use package::NetworkConfig;
+        let global = NpxcConfig::default();
+        let pkg = PackageConfig {
+            network: Some(NetworkConfig {
+                mode: "allowlist".to_string(),
+                allow: vec!["api.anthropic.com:443".to_string()],
+            }),
+            ..Default::default()
+        };
+        let eff = merge::merge(&global, Some(&pkg));
+        assert_eq!(
+            eff.network,
+            NetworkPolicy::Allowlist {
+                allow: vec!["api.anthropic.com:443".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn merge_network_table_open_mode_maps_to_default() {
+        use package::NetworkConfig;
+        let global = NpxcConfig::default();
+        let pkg = PackageConfig {
+            network: Some(NetworkConfig {
+                mode: "open".to_string(),
+                allow: vec![],
+            }),
+            ..Default::default()
+        };
+        let eff = merge::merge(&global, Some(&pkg));
+        assert_eq!(eff.network, NetworkPolicy::Named("default".to_string()));
+    }
+
+    #[test]
+    fn merge_network_table_takes_precedence_over_runtime_network() {
+        use package::{NetworkConfig, RuntimeOverride};
+        let global = NpxcConfig::default();
+        let pkg = PackageConfig {
+            runtime: Some(RuntimeOverride {
+                network: Some("bridge".to_string()),
+                ..Default::default()
+            }),
+            network: Some(NetworkConfig {
+                mode: "none".to_string(),
+                allow: vec![],
+            }),
+            ..Default::default()
+        };
+        let eff = merge::merge(&global, Some(&pkg));
+        // The [network] table wins over the legacy [runtime] network string.
+        assert_eq!(eff.network, NetworkPolicy::None);
     }
 
     // ── pin / load round-trip ─────────────────────────────────────────────────

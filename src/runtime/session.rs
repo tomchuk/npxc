@@ -9,7 +9,7 @@ use crate::{
     paths::{SessionState, validate_path},
 };
 
-use super::proc::ContainerProcess;
+use super::{network::ManagedNetwork, proc::ContainerProcess};
 
 // ── Launch plan types ─────────────────────────────────────────────────────────
 
@@ -189,6 +189,9 @@ pub struct Session {
     ///
     /// [`take_container`]: Session::take_container
     container: Option<ContainerProcess>,
+    /// The per-session container network npxc created (if any). Deleted on
+    /// teardown, after the container has stopped.
+    network: Option<ManagedNetwork>,
     /// Set once async [`teardown`] has cleaned up, so the synchronous [`Drop`]
     /// impl knows to skip its best-effort pass.
     ///
@@ -224,6 +227,7 @@ impl Session {
         pkg_name: &str,
         image_tag: &str,
         config: &EffectiveConfig,
+        network_arg: &str,
         plan: &LaunchPlan,
         session_dir_parent: Option<&std::path::Path>,
     ) -> Result<Self, NpxcError> {
@@ -255,7 +259,7 @@ impl Session {
             "--name",
             &container_name,
             "--network",
-            &config.network,
+            network_arg,
             "--read-only",
             "--tmpfs",
             "/tmp",
@@ -322,8 +326,20 @@ impl Session {
             state: Arc::new(SessionState::new()),
             session_dir,
             container: Some(container),
+            network: None,
             cleaned: false,
         })
+    }
+
+    /// Attach a per-session [`ManagedNetwork`] for cleanup on teardown.
+    ///
+    /// The caller provisions the network before [`start`] and hands it over
+    /// once the session exists, so the session owns deletion of the network it
+    /// runs on.
+    ///
+    /// [`start`]: Session::start
+    pub fn attach_network(&mut self, network: Option<ManagedNetwork>) {
+        self.network = network;
     }
 
     /// Transfer ownership of the container process to the caller.
@@ -347,6 +363,16 @@ impl Session {
             c.kill_and_wait().await;
         }
         let _ = tokio::fs::remove_dir_all(&self.session_dir).await;
+        // Delete the network only after the container has stopped.
+        if let Some(net) = self.network.take() {
+            if let Err(e) = net.delete().await {
+                tracing::warn!(
+                    network = %net.name(),
+                    error = %e,
+                    "failed to delete per-session network",
+                );
+            }
+        }
         self.cleaned = true;
     }
 }
@@ -364,6 +390,9 @@ impl Drop for Session {
             c.kill_now();
         }
         let _ = std::fs::remove_dir_all(&self.session_dir);
+        if let Some(net) = &self.network {
+            net.delete_blocking();
+        }
     }
 }
 
@@ -377,7 +406,7 @@ mod tests {
 
     use crate::{
         config::{
-            EffectiveConfig,
+            EffectiveConfig, NetworkPolicy,
             package::{MountConfig, StorageConfig},
         },
         error::NpxcError,
@@ -391,7 +420,7 @@ mod tests {
         EffectiveConfig {
             node_image: String::new(),
             container_cli: String::new(),
-            network: String::new(),
+            network: NetworkPolicy::None,
             memory: String::new(),
             cpus: String::new(),
             mount_mode: String::new(),
