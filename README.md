@@ -208,7 +208,7 @@ env_passthrough = ["OPENAI_API_KEY", "GITHUB_TOKEN"]
 
 # Mount a per-package persistent host directory read-write at /data.
 # The host directory is created at:
-#   ~/Library/Application Support/npxc/packages/<sanitized-name>/   (macOS)
+#   ~/.local/share/npxc/packages/<sanitized-name>/   (honors $XDG_DATA_HOME)
 # Use this for servers that need to maintain state across sessions
 # (e.g. server-memory, SQLite-backed servers).
 [storage]

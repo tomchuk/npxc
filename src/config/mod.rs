@@ -172,9 +172,12 @@ pub fn validate_version(version: &str) -> Result<(), NpxcError> {
 /// Resolution order:
 /// 1. If `config_override` is `Some(path)` — return `path`'s **parent**
 ///    directory (the file lives inside the config dir).
-/// 2. XDG / platform config dir via
-///    `directories::ProjectDirs::from("", "", "npxc")`.
-/// 3. Hard fallback: `~/.config/npxc`.
+/// 2. `$XDG_CONFIG_HOME/npxc` if `XDG_CONFIG_HOME` is set to an absolute path.
+/// 3. `~/.config/npxc`.
+///
+/// This deliberately uses the XDG `~/.config` convention on every platform —
+/// including macOS, where the Apple "Application Support" location is
+/// surprising for a developer CLI and disagrees with the documented path.
 ///
 /// # Errors
 ///
@@ -191,14 +194,37 @@ pub fn config_dir(config_override: Option<&PathBuf>) -> Result<PathBuf, NpxcErro
         return Ok(parent.to_path_buf());
     }
 
-    if let Some(proj) = directories::ProjectDirs::from("", "", "npxc") {
-        return Ok(proj.config_dir().to_path_buf());
-    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = directories::BaseDirs::new().map(|bd| bd.home_dir().to_path_buf());
+    Ok(resolve_xdg_dir(xdg, home, ".config"))
+}
 
-    // Hard fallback: ~/.config/npxc
-    let home = directories::BaseDirs::new()
-        .map_or_else(|| PathBuf::from("~"), |bd| bd.home_dir().to_path_buf());
-    Ok(home.join(".config").join("npxc"))
+/// Return the npxc data directory (`~/.local/share/npxc`, honoring an absolute
+/// `$XDG_DATA_HOME`). Used for persistent per-package storage.
+///
+/// Like [`config_dir`], this uses the XDG `~/.local/share` convention on every
+/// platform for consistency.
+#[must_use]
+pub fn data_dir() -> PathBuf {
+    let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let home = directories::BaseDirs::new().map(|bd| bd.home_dir().to_path_buf());
+    resolve_xdg_dir(xdg, home, ".local/share")
+}
+
+/// Resolve an XDG-style npxc directory from the relevant `XDG_*_HOME` and home
+/// inputs. Honors an *absolute* `$XDG_*_HOME`, else falls back to
+/// `<home>/<home_relative>`, then appends `npxc`. Pure (no env access) so it is
+/// testable.
+fn resolve_xdg_dir(
+    xdg_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    home_relative: &str,
+) -> PathBuf {
+    let base = xdg_home
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(home_relative)))
+        .unwrap_or_else(|| PathBuf::from(home_relative));
+    base.join("npxc")
 }
 
 /// Compute the path to the package-specific config file.
@@ -684,5 +710,39 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = load_package_config("no-such-pkg", dir.path()).expect("ok");
         assert!(result.is_none());
+    }
+
+    // ── XDG dir resolution ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_xdg_dir_honors_absolute_xdg() {
+        let dir = resolve_xdg_dir(
+            Some(PathBuf::from("/custom/xdg")),
+            Some(PathBuf::from("/home/u")),
+            ".config",
+        );
+        assert_eq!(dir, PathBuf::from("/custom/xdg/npxc"));
+    }
+
+    #[test]
+    fn resolve_xdg_dir_ignores_relative_xdg() {
+        let dir = resolve_xdg_dir(
+            Some(PathBuf::from("relative/xdg")),
+            Some(PathBuf::from("/home/u")),
+            ".config",
+        );
+        assert_eq!(dir, PathBuf::from("/home/u/.config/npxc"));
+    }
+
+    #[test]
+    fn resolve_xdg_dir_config_falls_back_to_home() {
+        let dir = resolve_xdg_dir(None, Some(PathBuf::from("/home/u")), ".config");
+        assert_eq!(dir, PathBuf::from("/home/u/.config/npxc"));
+    }
+
+    #[test]
+    fn resolve_xdg_dir_data_falls_back_to_home_local_share() {
+        let dir = resolve_xdg_dir(None, Some(PathBuf::from("/home/u")), ".local/share");
+        assert_eq!(dir, PathBuf::from("/home/u/.local/share/npxc"));
     }
 }
