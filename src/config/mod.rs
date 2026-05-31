@@ -391,12 +391,17 @@ fn validate_runtime(effective: &EffectiveConfig) -> Result<(), NpxcError> {
         }
     }
 
-    if let NetworkPolicy::Named(name) = &effective.network {
-        tracing::warn!(
-            network = %name,
-            "container attached to a named network; egress is unfiltered \
-             (use [network] mode = \"allowlist\" to restrict it)"
-        );
+    match &effective.network {
+        NetworkPolicy::Named(name) => {
+            tracing::warn!(
+                network = %name,
+                "container attached to a named network; egress is unfiltered \
+                 (use [network] mode = \"allowlist\" to restrict it)"
+            );
+        }
+        // Surface a malformed allowlist entry before a container is launched.
+        NetworkPolicy::Allowlist { allow } => crate::tunnel::policy::validate(allow)?,
+        NetworkPolicy::None => {}
     }
 
     Ok(())

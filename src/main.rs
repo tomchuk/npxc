@@ -107,11 +107,11 @@ async fn run_package(args: Vec<String>, global: GlobalOpts) -> Result<(), NpxcEr
     // up `wg0`. The returned tunnel must outlive the container, so it is held
     // in `_tunnel` until the session finishes below.
     let _tunnel = match (&effective.network, &managed_network) {
-        (NetworkPolicy::Allowlist { .. }, Some(net)) => {
+        (NetworkPolicy::Allowlist { allow }, Some(net)) => {
             let gateway = net.gateway.parse().map_err(|e| {
                 NpxcError::Runtime(format!("invalid gateway address {:?}: {e}", net.gateway))
             })?;
-            let setup = tunnel::establish(gateway).await?;
+            let setup = tunnel::establish(gateway, allow).await?;
             plan.env_literal.extend(setup.env.iter().cloned());
             // Mount npxc's resolv.conf so the guest resolves through the tunnel
             // rather than the host's (possibly host-only-unreachable) resolver.

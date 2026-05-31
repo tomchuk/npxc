@@ -61,6 +61,8 @@ boringtun = { version = "0.7", default-features = false }
 base64 = "0.22"
 getrandom = "0.4.2"
 ipstack = "1.0.0"
+ipnet = "2"
+tls-parser = "0.12"
 
 [dev-dependencies]
 assert_cmd         = "2"

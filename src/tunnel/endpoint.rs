@@ -7,6 +7,7 @@
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use tempfile::NamedTempFile;
@@ -17,6 +18,8 @@ use tracing::debug;
 
 use super::device::WgDevice;
 use super::keys::WgKeypair;
+use super::peek;
+use super::policy::{Decision, Policy};
 use super::wg::WgTunnel;
 use crate::error::NpxcError;
 
@@ -28,8 +31,17 @@ const GUEST_WG_ADDRESS: &str = "10.7.0.2/32";
 
 /// Resolver the guest is pointed at. Reached through the tunnel (the guest's
 /// default route is `wg0`), so DNS is forwarded by npxc regardless of the
-/// host's own DNS configuration.
-const TUNNEL_NAMESERVER: &str = "1.1.1.1";
+/// host's own DNS configuration. The egress policy implicitly permits DNS to
+/// this address (see [`Policy::build`]) so hostname rules can resolve.
+const TUNNEL_NAMESERVER: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
+/// Well-known port for plaintext HTTP, where the destination host is read from
+/// the `Host` request header.
+const HTTP_PORT: u16 = 80;
+
+/// Well-known port for HTTPS, where the destination host is read from the TLS
+/// `ClientHello` SNI.
+const HTTPS_PORT: u16 = 443;
 
 /// Per-UDP-flow relay buffer size.
 const UDP_BUF: usize = 2048;
@@ -55,12 +67,15 @@ pub struct TunnelSetup {
 ///
 /// `gateway` is the container network's gateway — the host address the guest
 /// reaches over the host-only network, and thus the `WireGuard` endpoint it
-/// dials.
+/// dials. `allow` is the egress allowlist from the package config; an empty
+/// list denies everything except DNS.
 ///
 /// # Errors
 ///
-/// Returns [`NpxcError::Runtime`] if the UDP socket cannot be bound.
-pub async fn establish(gateway: IpAddr) -> Result<TunnelSetup, NpxcError> {
+/// Returns [`NpxcError::Config`] if an `allow` entry is malformed, or
+/// [`NpxcError::Runtime`] if the UDP socket cannot be bound.
+pub async fn establish(gateway: IpAddr, allow: &[String]) -> Result<TunnelSetup, NpxcError> {
+    let policy = Arc::new(Policy::build(allow, IpAddr::V4(TUNNEL_NAMESERVER))?);
     let npxc_kp = WgKeypair::generate();
     let guest_kp = WgKeypair::generate();
 
@@ -80,7 +95,7 @@ pub async fn establish(gateway: IpAddr) -> Result<TunnelSetup, NpxcError> {
         socket,
         WgTunnel::new(npxc_kp.secret(), guest_kp.public(), 1),
     );
-    let tunnel = Tunnel::spawn(device);
+    let tunnel = Tunnel::spawn(device, policy);
 
     let env = guest_env(&guest_kp, &npxc_kp, gateway, port);
     let resolv_conf = write_resolv_conf()?;
@@ -130,9 +145,10 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// Spawn the datapath over `device`, forwarding every flow (passthrough).
+    /// Spawn the datapath over `device`, forwarding each flow the `policy`
+    /// permits and resetting the rest.
     #[must_use]
-    pub fn spawn(device: WgDevice) -> Self {
+    pub fn spawn(device: WgDevice, policy: Arc<Policy>) -> Self {
         let mut config = IpStackConfig::default();
         let _ = config.mtu(MTU);
         let mut ip_stack = IpStack::new(config, device);
@@ -141,10 +157,10 @@ impl Tunnel {
             loop {
                 match ip_stack.accept().await {
                     Ok(IpStackStream::Tcp(tcp)) => {
-                        tokio::spawn(forward_tcp(tcp));
+                        tokio::spawn(forward_tcp(tcp, Arc::clone(&policy)));
                     }
                     Ok(IpStackStream::Udp(udp)) => {
-                        tokio::spawn(forward_udp(udp));
+                        tokio::spawn(forward_udp(udp, Arc::clone(&policy)));
                     }
                     // ICMP and anything we don't terminate is dropped for now.
                     Ok(_) => {}
@@ -170,22 +186,59 @@ impl Drop for Tunnel {
     }
 }
 
-/// Forward a guest TCP connection to its real destination.
-async fn forward_tcp(mut guest: IpStackTcpStream) {
+/// Forward a guest TCP connection to its real destination if the policy allows.
+///
+/// For HTTPS/HTTP the destination hostname is peeked (TLS SNI / HTTP `Host`)
+/// before the policy decision; the peeked bytes are replayed to the upstream
+/// socket so the connection is byte-for-byte intact. A denied flow is dropped,
+/// which tears down the guest's connection.
+async fn forward_tcp(mut guest: IpStackTcpStream, policy: Arc<Policy>) {
     let dest = guest.peer_addr();
-    match TcpStream::connect(dest).await {
-        Ok(mut upstream) => {
-            if let Err(e) = copy_bidirectional(&mut guest, &mut upstream).await {
-                debug!(?e, %dest, "tcp forward ended");
-            }
+
+    // Peek a hostname on the well-known TLS/HTTP ports so domain rules apply.
+    // `prefix` holds whatever was consumed during the peek, for replay.
+    let mut prefix = Vec::new();
+    let hostname = match dest.port() {
+        HTTPS_PORT => peek::tls_sni(&mut guest, &mut prefix).await,
+        HTTP_PORT => peek::http_host(&mut guest, &mut prefix).await,
+        _ => None,
+    };
+
+    if policy.evaluate(dest.ip(), dest.port(), hostname.as_deref()) == Decision::Deny {
+        debug!(%dest, ?hostname, "egress denied (tcp)");
+        return;
+    }
+
+    let mut upstream = match TcpStream::connect(dest).await {
+        Ok(upstream) => upstream,
+        Err(e) => {
+            debug!(?e, %dest, "tcp connect failed");
+            return;
         }
-        Err(e) => debug!(?e, %dest, "tcp connect failed"),
+    };
+
+    // Replay the bytes consumed while peeking before splicing the rest.
+    if !prefix.is_empty() {
+        if let Err(e) = upstream.write_all(&prefix).await {
+            debug!(?e, %dest, "failed to replay peeked bytes");
+            return;
+        }
+    }
+
+    if let Err(e) = copy_bidirectional(&mut guest, &mut upstream).await {
+        debug!(?e, %dest, "tcp forward ended");
     }
 }
 
-/// Forward a guest UDP flow to its real destination by relaying datagrams.
-async fn forward_udp(mut guest: IpStackUdpStream) {
+/// Forward a guest UDP flow to its real destination by relaying datagrams, if
+/// the policy allows. UDP carries no peekable hostname, so the decision is by
+/// IP/port alone (DNS to the pinned resolver is implicitly permitted).
+async fn forward_udp(mut guest: IpStackUdpStream, policy: Arc<Policy>) {
     let dest = guest.peer_addr();
+    if policy.evaluate(dest.ip(), dest.port(), None) == Decision::Deny {
+        debug!(%dest, "egress denied (udp)");
+        return;
+    }
     let bind: SocketAddr = if dest.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
