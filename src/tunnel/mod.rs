@@ -14,4 +14,4 @@ pub mod keys;
 pub mod wg;
 
 pub use keys::WgKeypair;
-pub use wg::{Outbound, WgTunnel};
+pub use wg::WgTunnel;
