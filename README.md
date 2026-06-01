@@ -8,9 +8,12 @@
 Sandboxed npm execution for MCP servers.
 
 Runs Node.js / npm-based [Model Context Protocol](https://modelcontextprotocol.io) servers
-inside an isolated Linux VM via [Apple `container`](https://github.com/apple/container),
-with dynamic per-request filesystem scoping to the host process's working
-directory and optional allowlist-filtered network egress.
+inside an isolated Linux VM via [Apple `container`](https://github.com/apple/container).
+Each server is locked down by default: no network, an empty environment, a
+read-only root filesystem, and filesystem access limited to the files it is
+explicitly asked to read under the working directory. Extra mounts, persistent
+storage, environment variables, and allowlist-filtered network egress are all
+opt-in per package.
 
 ---
 
@@ -94,10 +97,12 @@ convention) is silently absorbed, so configs copied verbatim from `npx` to
 }
 ```
 
-The MCP client sees the server as if it were a local process; the package
-actually runs inside an isolated VM with no network access by default and
-filesystem access scoped to the current working directory. To grant a server
-filtered outbound access, see [Network egress](#network-egress).
+The MCP client sees the server as if it were a local process. The package runs
+inside an isolated VM, locked down by default: no network (see
+[Network egress](#network-egress)), an empty environment (see
+[Environment variables](#environment-variables)), and filesystem access limited
+to the files it asks for under the working directory (see
+[Filesystem access](#filesystem-access)).
 
 ### Live example
 
@@ -280,6 +285,71 @@ env_passthrough: ["OPENAI_API_KEY", "GITHUB_TOKEN"]
 storage:         persist → /data (rw)
 mount:           /Users/me/project → /project (ro)
 ```
+
+---
+
+## Filesystem access
+
+The container's `/workspace` starts empty and is populated on demand. When a
+tool call names a file, npxc recognizes that argument as a path, and the file
+resolves within the working directory, npxc publishes just that file into the
+workspace for the call. Anything npxc does not identify as a path, or that
+resolves outside the working directory, is never published and stays invisible
+to the package. This is a fail-closed boundary; path identification is only a
+usability layer on top of it.
+
+Three opt-in mechanisms widen access when a server needs more:
+
+- **Explicit mounts.** Each `[[mounts]]` entry binds a host directory into the
+  container, read-only by default (`mode = "rw"` for read-write). Host paths are
+  validated to lie within the working-directory scope, the same rule as per-file
+  publication.
+- **Persistent storage.** `[storage] persist = true` mounts a per-package host
+  directory read-write at `/data`, created on first run under the platform data
+  directory (`~/.local/share/npxc/packages/<name>/`). This is how state-bearing
+  servers (for example `server-memory`) keep data across sessions.
+  `storage.writable` adds ephemeral `tmpfs` paths for servers that write to a
+  fixed location but do not need durability.
+- **No isolation.** `--no-isolate` skips per-file publication and mounts the
+  whole working directory read-only instead. It warns loudly and is meant only
+  for servers that cannot work with on-demand publication.
+
+The session workspace is mounted read-only by default; set `mount_mode = "rw"`
+only if a server must write into its working directory.
+
+### Path identification
+
+npxc decides which tool-call arguments are file paths using the strategies in
+`[paths] strategies`, tried in order with their results unioned:
+
+- `config`: argument names you declare per tool in `[path_arguments]` (with
+  `"*"` as a wildcard), minus any listed in `[non_path_arguments]`.
+- `schema`: paths inferred from the server's advertised tool input schemas.
+- `heuristic`: arguments that look like paths (absolute `/...`, home `~/...`, or
+  `file://` URIs), controlled by `[paths.heuristic]`.
+
+Because publication is fail-closed, a path npxc misses simply is not shared; if a
+server needs a file npxc did not recognize, declare its argument in
+`[path_arguments]`. `[non_path_arguments]` suppresses false positives such as
+URLs or query strings.
+
+---
+
+## Environment variables
+
+The container inherits nothing from the host environment. Two opt-in mechanisms
+provide what a server needs:
+
+- **Literals.** `[env]` values are injected directly. Use this for non-secret
+  configuration such as `NODE_OPTIONS` or feature flags; the values live in the
+  config file.
+- **Passthrough.** `env_passthrough` lists the *names* of host environment
+  variables to forward. Only the name is stored in config; npxc reads the value
+  from its own environment at launch and never writes it to disk. Use this for
+  secrets like API keys and tokens. The container sees only the variables you
+  list, never the full host environment.
+
+Arguments after `--` are forwarded to the server unchanged.
 
 ---
 
