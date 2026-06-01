@@ -155,10 +155,11 @@ fn host_from_http(buf: &[u8]) -> Peek {
 
     for line in region.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"host:") {
-            if let Some(host) = parse_host_value(&line[5..]) {
-                return Peek::Found(host);
-            }
+        if line.len() >= 5
+            && line[..5].eq_ignore_ascii_case(b"host:")
+            && let Some(host) = parse_host_value(&line[5..])
+        {
+            return Peek::Found(host);
         }
     }
 

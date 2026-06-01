@@ -425,10 +425,10 @@ pub fn ensure_version_pinned(
     let existing = load_package_config(pkg_name, &cdir)?;
 
     // Skip if the pinned version already matches.
-    if let Some(cfg) = &existing {
-        if cfg.version.as_deref() == Some(version) {
-            return Ok(());
-        }
+    if let Some(cfg) = &existing
+        && cfg.version.as_deref() == Some(version)
+    {
+        return Ok(());
     }
 
     pin_package_version(pkg_name, version, &cdir)

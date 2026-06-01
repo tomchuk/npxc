@@ -2,7 +2,7 @@
 name        = "npxc"
 version     = "0.2.0"
 edition     = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "Sandboxed npm execution for MCP servers via Apple container"
 license     = "MIT"
 repository  = "https://github.com/tomchuk/npxc"
@@ -19,17 +19,17 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime (only the features npxc actually uses)
 tokio              = { version = "1", features = [
-    "rt-multi-thread",
-    "macros",
-    "process",
-    "io-util",
-    "io-std",
-    "fs",
-    "net",
-    "sync",
-    "signal",
-    "time",
-] }
+                       "rt-multi-thread",
+                       "macros",
+                       "process",
+                       "io-util",
+                       "io-std",
+                       "fs",
+                       "net",
+                       "sync",
+                       "signal",
+                       "time",
+                     ] }
 
 # CLI
 clap               = { version = "4", features = ["derive", "env"] }
@@ -57,19 +57,17 @@ directories        = "5"
 which              = "6"
 
 tempfile           = "3"
-boringtun = { version = "0.7", default-features = false }
-base64 = "0.22"
-getrandom = "0.4.2"
-ipstack = "1.0.0"
-ipnet = "2"
-tls-parser = "0.12"
-# DNS message parse/build only (in-tunnel allowlist resolver). No runtime/TLS.
-# Pinned to 0.25 to stay within npxc's MSRV (0.26 requires Rust 1.88).
-hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
+boringtun          = { version = "0.7", default-features = false }
+base64             = "0.22"
+getrandom          = "0.4.2"
+ipstack            = "1.0.0"
+ipnet              = "2"
+tls-parser         = "0.12"
+hickory-proto      = { version = "0.26.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 assert_cmd         = "2"
-etherparse = "0.19"
+etherparse         = "0.19"
 predicates         = "3"
 
 [features]

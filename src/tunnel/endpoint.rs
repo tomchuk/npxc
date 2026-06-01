@@ -253,11 +253,11 @@ async fn forward_tcp(mut guest: IpStackTcpStream, policy: Arc<Policy>) {
     };
 
     // Replay the bytes consumed while peeking before splicing the rest.
-    if !prefix.is_empty() {
-        if let Err(e) = upstream.write_all(&prefix).await {
-            debug!(?e, %dest, "failed to replay peeked bytes");
-            return;
-        }
+    if !prefix.is_empty()
+        && let Err(e) = upstream.write_all(&prefix).await
+    {
+        debug!(?e, %dest, "failed to replay peeked bytes");
+        return;
     }
 
     if let Err(e) = copy_bidirectional(&mut guest, &mut upstream).await {

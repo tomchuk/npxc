@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, ResponseCode};
 use ipstack::IpStackUdpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -91,10 +91,10 @@ pub async fn serve(mut guest: IpStackUdpStream, resolver: SocketAddr, policy: Ar
             }
             Verdict::Refuse(name) => {
                 warn!(target: "npxc::egress", proto = "dns", %name, "deny (nxdomain)");
-                if let Some(response) = nxdomain(datagram) {
-                    if guest.write_all(&response).await.is_err() {
-                        break;
-                    }
+                if let Some(response) = nxdomain(datagram)
+                    && guest.write_all(&response).await.is_err()
+                {
+                    break;
                 }
             }
             Verdict::Unparsable => debug!("dns: dropping unparseable query"),
@@ -116,7 +116,7 @@ fn decide(datagram: &[u8], policy: &Policy) -> Verdict {
     let Ok(message) = Message::from_vec(datagram) else {
         return Verdict::Unparsable;
     };
-    let Some(query) = message.queries().first() else {
+    let Some(query) = message.queries.first() else {
         return Verdict::Unparsable;
     };
     // `to_ascii()` yields a fully-qualified name with a trailing dot.
@@ -134,16 +134,16 @@ fn decide(datagram: &[u8], policy: &Policy) -> Verdict {
 /// Returns `None` only if the query can't be parsed (already handled upstream).
 fn nxdomain(query: &[u8]) -> Option<Vec<u8>> {
     let request = Message::from_vec(query).ok()?;
-    let mut response = Message::new();
-    response.set_id(request.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(OpCode::Query);
-    response.set_recursion_desired(request.recursion_desired());
-    response.set_recursion_available(true);
-    response.set_response_code(ResponseCode::NXDomain);
-    for question in request.queries() {
-        response.add_query(question.clone());
-    }
+    // `error_msg` builds a response carrying the id, op code, and response code;
+    // we then echo the question and mirror the recursion flags.
+    let mut response = Message::error_msg(
+        request.metadata.id,
+        request.metadata.op_code,
+        ResponseCode::NXDomain,
+    );
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.add_queries(request.queries);
     response.to_vec().ok()
 }
 
@@ -152,7 +152,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use hickory_proto::op::Query;
+    use hickory_proto::op::{MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
 
     const DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
@@ -164,11 +164,8 @@ mod tests {
 
     /// Encode a standard recursive A query for `name`.
     fn query_for(name: &str, id: u16) -> Vec<u8> {
-        let mut message = Message::new();
-        message.set_id(id);
-        message.set_message_type(MessageType::Query);
-        message.set_op_code(OpCode::Query);
-        message.set_recursion_desired(true);
+        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
         let name = Name::from_ascii(name).unwrap();
         message.add_query(Query::query(name, RecordType::A));
         message.to_vec().unwrap()
@@ -204,12 +201,12 @@ mod tests {
         let response = nxdomain(&query).expect("build NXDOMAIN");
         let parsed = Message::from_vec(&response).unwrap();
 
-        assert_eq!(parsed.id(), 0x1234);
-        assert_eq!(parsed.message_type(), MessageType::Response);
-        assert_eq!(parsed.response_code(), ResponseCode::NXDomain);
-        assert_eq!(parsed.queries().len(), 1);
+        assert_eq!(parsed.metadata.id, 0x1234);
+        assert_eq!(parsed.metadata.message_type, MessageType::Response);
+        assert_eq!(parsed.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(parsed.queries.len(), 1);
         assert_eq!(
-            parsed.queries()[0].name().to_ascii(),
+            parsed.queries[0].name().to_ascii(),
             "denied.example.",
             "the original question must be echoed back"
         );
