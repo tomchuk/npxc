@@ -206,7 +206,7 @@ mod tests {
         EffectiveConfig {
             node_image: String::new(),
             container_cli: String::new(),
-            network: String::new(),
+            network: crate::config::merge::NetworkPolicy::None,
             memory: String::new(),
             cpus: String::new(),
             mount_mode: String::new(),

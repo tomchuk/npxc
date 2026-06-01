@@ -4,12 +4,12 @@ use tokio::process::Command;
 use tracing::debug;
 
 use crate::{
-    config::{EffectiveConfig, sanitize_package_name},
+    config::{EffectiveConfig, data_dir, sanitize_package_name},
     error::NpxcError,
     paths::{SessionState, validate_path},
 };
 
-use super::proc::ContainerProcess;
+use super::{network::ManagedNetwork, proc::ContainerProcess};
 
 // ── Launch plan types ─────────────────────────────────────────────────────────
 
@@ -77,6 +77,12 @@ pub struct LaunchPlan {
     ///
     /// These are forwarded verbatim to the container's entrypoint.
     pub args: Vec<String>,
+
+    /// Linux capabilities to add back on top of `--cap-drop ALL`.
+    ///
+    /// Each entry becomes a `--cap-add <CAP>` argument. Used by tunnel mode to
+    /// grant `NET_ADMIN` so the entrypoint can configure `wg0`.
+    pub cap_add: Vec<String>,
 }
 
 impl LaunchPlan {
@@ -98,10 +104,8 @@ impl LaunchPlan {
     /// # Errors
     ///
     /// Returns [`NpxcError::PathOutOfScope`] or [`NpxcError::PathNotFound`]
-    /// if a config-declared mount path fails CWD validation,
-    /// [`NpxcError::Config`] if the platform data directory cannot be
-    /// determined, or [`NpxcError::Io`] if the persistent storage directory
-    /// cannot be created.
+    /// if a config-declared mount path fails CWD validation, or
+    /// [`NpxcError::Io`] if the persistent storage directory cannot be created.
     pub fn build(
         pkg_name: &str,
         effective: &EffectiveConfig,
@@ -118,6 +122,7 @@ impl LaunchPlan {
                 .collect(),
             env_passthrough: effective.env_passthrough.clone(),
             mounts: Vec::new(),
+            cap_add: Vec::new(),
         };
 
         // Config-declared directory mounts, validated within CWD scope.
@@ -139,14 +144,10 @@ impl LaunchPlan {
         // Persistent storage: per-package host dir mounted rw at /data.
         if effective.storage.as_ref().is_some_and(|s| s.persist) {
             let sanitized = sanitize_package_name(pkg_name);
-            let data_dir = directories::ProjectDirs::from("", "", "npxc")
-                .map(|dirs| dirs.data_dir().join("packages").join(&sanitized))
-                .ok_or_else(|| {
-                    NpxcError::Config("cannot determine platform data directory".into())
-                })?;
-            std::fs::create_dir_all(&data_dir)?;
+            let host_dir = data_dir().join("packages").join(&sanitized);
+            std::fs::create_dir_all(&host_dir)?;
             plan.mounts.push(Mount {
-                host: data_dir,
+                host: host_dir,
                 container: "/data".to_string(),
                 mode: MountMode::Rw,
             });
@@ -189,6 +190,15 @@ pub struct Session {
     ///
     /// [`take_container`]: Session::take_container
     container: Option<ContainerProcess>,
+    /// The per-session container network npxc created (if any). Deleted on
+    /// teardown, after the container has stopped.
+    network: Option<ManagedNetwork>,
+    /// Runtime CLI binary and the container's `--name`. Kept so teardown can
+    /// force-remove the container by name: sending SIGKILL to the local
+    /// `container run` client doesn't stop the container in the VM, which would
+    /// leave it running (holding the network) and orphaned.
+    container_cli: String,
+    container_name: String,
     /// Set once async [`teardown`] has cleaned up, so the synchronous [`Drop`]
     /// impl knows to skip its best-effort pass.
     ///
@@ -224,6 +234,7 @@ impl Session {
         pkg_name: &str,
         image_tag: &str,
         config: &EffectiveConfig,
+        network_arg: &str,
         plan: &LaunchPlan,
         session_dir_parent: Option<&std::path::Path>,
     ) -> Result<Self, NpxcError> {
@@ -255,10 +266,14 @@ impl Session {
             "--name",
             &container_name,
             "--network",
-            &config.network,
+            network_arg,
             "--read-only",
             "--tmpfs",
             "/tmp",
+            // Writable /run for the userspace WireGuard control socket
+            // (/run/wireguard/wg0.sock) under the otherwise read-only root.
+            "--tmpfs",
+            "/run",
             "--cap-drop",
             "ALL",
             "-m",
@@ -292,6 +307,11 @@ impl Session {
             cmd.args(["-e", k]);
         }
 
+        // Capabilities added back on top of --cap-drop ALL (e.g. NET_ADMIN).
+        for cap in &plan.cap_add {
+            cmd.args(["--cap-add", cap]);
+        }
+
         // Image tag comes after all flags.
         cmd.arg(image_tag);
 
@@ -322,8 +342,22 @@ impl Session {
             state: Arc::new(SessionState::new()),
             session_dir,
             container: Some(container),
+            network: None,
+            container_cli: config.container_cli.clone(),
+            container_name,
             cleaned: false,
         })
+    }
+
+    /// Attach a per-session [`ManagedNetwork`] for cleanup on teardown.
+    ///
+    /// The caller provisions the network before [`start`] and hands it over
+    /// once the session exists, so the session owns deletion of the network it
+    /// runs on.
+    ///
+    /// [`start`]: Session::start
+    pub fn attach_network(&mut self, network: Option<ManagedNetwork>) {
+        self.network = network;
     }
 
     /// Transfer ownership of the container process to the caller.
@@ -346,9 +380,32 @@ impl Session {
         if let Some(ref mut c) = self.container {
             c.kill_and_wait().await;
         }
+        // Reaping the local `container run` client doesn't stop the container in
+        // the VM; force-remove it by name so it actually exits and releases the
+        // network (and isn't left orphaned).
+        force_remove_container(&self.container_cli, &self.container_name).await;
         let _ = tokio::fs::remove_dir_all(&self.session_dir).await;
+        // Delete the network now that the container is gone. A bounded retry
+        // absorbs the brief window where the runtime still reports it in use.
+        if let Some(net) = self.network.take() {
+            net.delete_with_retry().await;
+        }
         self.cleaned = true;
     }
+}
+
+/// Force-remove a container by name (`container rm --force`), best-effort.
+///
+/// `--force` stops a running container before removing it, which releases the
+/// per-session network. Errors (e.g. the container is already gone because the
+/// `--rm` run exited cleanly) are ignored.
+async fn force_remove_container(container_cli: &str, name: &str) {
+    let _ = Command::new(container_cli)
+        .args(["rm", "--force", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 impl Drop for Session {
@@ -363,7 +420,16 @@ impl Drop for Session {
         if let Some(ref mut c) = self.container {
             c.kill_now();
         }
+        // Force-remove the container so it releases the network (sync, best-effort).
+        let _ = std::process::Command::new(&self.container_cli)
+            .args(["rm", "--force", &self.container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = std::fs::remove_dir_all(&self.session_dir);
+        if let Some(net) = &self.network {
+            net.delete_blocking();
+        }
     }
 }
 
@@ -377,7 +443,7 @@ mod tests {
 
     use crate::{
         config::{
-            EffectiveConfig,
+            EffectiveConfig, NetworkPolicy,
             package::{MountConfig, StorageConfig},
         },
         error::NpxcError,
@@ -391,7 +457,7 @@ mod tests {
         EffectiveConfig {
             node_image: String::new(),
             container_cli: String::new(),
-            network: String::new(),
+            network: NetworkPolicy::None,
             memory: String::new(),
             cpus: String::new(),
             mount_mode: String::new(),

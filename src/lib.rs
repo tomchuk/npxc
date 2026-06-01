@@ -18,3 +18,4 @@ pub mod error;
 pub mod paths;
 pub mod rpc;
 pub mod runtime;
+pub mod tunnel;

@@ -26,6 +26,16 @@ pub fn image_tag(pkg_name: &str, version: &str) -> String {
     format!("npxc/{}:{}", sanitize_package_name(pkg_name), version)
 }
 
+/// `boringtun-cli` version compiled into the `WireGuard` base image.
+const BORINGTUN_VERSION: &str = "0.7.1";
+
+/// Tag of the prebuilt `WireGuard` base image. Versioned by [`BORINGTUN_VERSION`]
+/// so a version bump produces a new tag (and a one-time recompile) rather than
+/// silently reusing a stale binary.
+fn wg_base_tag() -> String {
+    format!("npxc/wg-base:{BORINGTUN_VERSION}")
+}
+
 // ── Inspect / existence check ─────────────────────────────────────────────────
 
 /// Return `true` if `tag` exists in the local image store, `false` if not.
@@ -80,6 +90,10 @@ pub async fn build_image(
     let tag = image_tag(pkg_name, version);
     let package_spec = format!("{pkg_name}@{version}");
 
+    // Compile the userspace-WireGuard binary once into a reusable base image;
+    // the package build below copies it instead of recompiling.
+    ensure_wg_base_image(&config.container_cli).await?;
+
     // Write the Dockerfile into a temporary build context directory.
     // The TempDir is held for the lifetime of this function; it is deleted on
     // drop (after the build command exits).
@@ -88,10 +102,13 @@ pub async fn build_image(
         .tempdir()
         .map_err(NpxcError::Io)?;
 
-    // Substitution of PACKAGE_SPEC / NODE_IMAGE happens via --build-arg below,
-    // so the template is written to the build context verbatim.
+    // PACKAGE_SPEC / NODE_IMAGE are passed via --build-arg below. The WireGuard
+    // base image tag is substituted into the template here because `COPY --from`
+    // can't reference a build ARG in this BuildKit frontend.
+    let dockerfile =
+        dockerfile::DOCKERFILE_TEMPLATE.replace("__NPXC_WG_BASE_IMAGE__", &wg_base_tag());
     let dockerfile_path = tmp.path().join("Dockerfile");
-    std::fs::write(&dockerfile_path, dockerfile::DOCKERFILE_TEMPLATE)?;
+    std::fs::write(&dockerfile_path, dockerfile)?;
 
     let mut cmd = Command::new(&config.container_cli);
     cmd.arg("build");
@@ -119,9 +136,72 @@ pub async fn build_image(
         NpxcError::RuntimeNotAvailable(format!("failed to spawn '{}': {e}", config.container_cli))
     })?;
 
-    // The BuildKit builder container persists after the build. Stop and delete
-    // it so it doesn't linger as a running container between npxc invocations.
+    // Tear the BuildKit builder down so no build state lingers between npxc
+    // invocations. The expensive WireGuard compile is cached as a persisted
+    // base image (see `ensure_wg_base_image`), not in the builder, so deleting
+    // the builder costs nothing on the next build.
     stop_builder(&config.container_cli).await;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(NpxcError::BuildFailed {
+            code: status.code(),
+        })
+    }
+}
+
+/// Ensure the prebuilt `WireGuard` base image ([`wg_base_tag`]) exists, building
+/// it once if it doesn't.
+///
+/// This is where the expensive `cargo install boringtun-cli` runs — exactly
+/// once per `boringtun-cli` version. The result is a tiny image in the local
+/// store, so it survives builder teardown and every later package build just
+/// `COPY --from`s the finished binary.
+///
+/// # Errors
+///
+/// Returns [`NpxcError::Io`] if the Dockerfile can't be written,
+/// [`NpxcError::RuntimeNotAvailable`] if the CLI can't be spawned, or
+/// [`NpxcError::BuildFailed`] if the base build exits non-zero.
+async fn ensure_wg_base_image(container_cli: &str) -> Result<(), NpxcError> {
+    let tag = wg_base_tag();
+    if image_exists(container_cli, &tag).await? {
+        tracing::debug!(%tag, "WireGuard base image present, skipping build");
+        return Ok(());
+    }
+
+    tracing::info!(
+        %tag,
+        "building WireGuard base image (one-time; compiles boringtun-cli)"
+    );
+
+    let tmp = tempfile::Builder::new()
+        .prefix("npxc-wgbase-")
+        .tempdir()
+        .map_err(NpxcError::Io)?;
+    let dockerfile_path = tmp.path().join("Dockerfile");
+    std::fs::write(&dockerfile_path, dockerfile::WG_BASE_DOCKERFILE)?;
+
+    let mut cmd = Command::new(container_cli);
+    cmd.arg("build");
+    cmd.args(["--platform", "linux/arm64"]);
+    cmd.args([
+        "--build-arg",
+        &format!("BORINGTUN_VERSION={BORINGTUN_VERSION}"),
+    ]);
+    cmd.args(["-t", &tag]);
+    cmd.args(["-f", &dockerfile_path.to_string_lossy()]);
+    cmd.arg(tmp.path());
+    cmd.stderr(Stdio::inherit());
+
+    debug!(cmd = ?cmd, "running container command");
+
+    let status = cmd.status().await.map_err(|e| {
+        NpxcError::RuntimeNotAvailable(format!("failed to spawn '{container_cli}': {e}"))
+    })?;
+
+    stop_builder(container_cli).await;
 
     if status.success() {
         Ok(())
@@ -134,6 +214,11 @@ pub async fn build_image(
 
 /// Stop and delete the `BuildKit` builder container (best-effort; errors are
 /// logged at debug level and do not propagate).
+///
+/// Deleting keeps a clean slate between builds: no builder VM or build cache
+/// lingers. This is cheap because the only expensive step — compiling
+/// `boringtun-cli` — is cached as a standalone base image in the image store
+/// (see [`ensure_wg_base_image`]), independent of the builder's lifecycle.
 async fn stop_builder(container_cli: &str) {
     for args in [
         ["builder", "stop"].as_slice(),
@@ -190,11 +275,14 @@ struct ContainerImage {
     reference: String,
 }
 
-/// List all npxc-managed images in the local image store.
+/// List npxc-managed **package** images in the local image store.
 ///
 /// Runs `<container_cli> image list --format json` and returns a
 /// `Vec<(repository, tag)>` for every image whose reference starts with
-/// `"npxc/"`.
+/// `"npxc/"`, excluding the internal [`wg_base_tag`] base image — it's a build
+/// dependency, not a package, so it stays out of `npxc list` and survives
+/// `npxc clean --all` (avoiding a needless one-time `boringtun-cli` recompile).
+/// Remove it manually (`container image rm npxc/wg-base:<ver>`) if desired.
 ///
 /// # Errors
 ///
@@ -223,7 +311,9 @@ pub async fn list_images(container_cli: &str) -> Result<Vec<(String, String)>, N
 
     Ok(all
         .into_iter()
-        .filter(|img| img.reference.starts_with("npxc/"))
+        .filter(|img| {
+            img.reference.starts_with("npxc/") && !img.reference.starts_with("npxc/wg-base:")
+        })
         .filter_map(|img| {
             // Split on the last `:` to separate repository from tag.
             // npxc images never contain a registry prefix, so the `npxc/`

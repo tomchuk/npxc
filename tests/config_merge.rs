@@ -5,8 +5,8 @@
 //! logic end-to-end.
 
 use npxc::config::{
-    ensure_version_pinned, load_package_config, package_config_path, pin_package_version,
-    resolve_config,
+    NetworkPolicy, ensure_version_pinned, load_package_config, package_config_path,
+    pin_package_version, resolve_config,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ fn global_defaults_only() {
     assert_eq!(eff.node_image, "node:lts-slim");
     assert_eq!(eff.memory, "512m");
     assert_eq!(eff.cpus, "1");
-    assert_eq!(eff.network, "none");
+    assert_eq!(eff.network, NetworkPolicy::None);
     assert_eq!(eff.mount_mode, "ro");
     assert!(eff.path_arguments.is_empty());
     assert!(eff.non_path_arguments.is_empty());
@@ -74,7 +74,8 @@ memory = "2g"
     );
     assert_eq!(eff.cpus, "1", "cpus should remain at global default");
     assert_eq!(
-        eff.network, "none",
+        eff.network,
+        NetworkPolicy::None,
         "network should remain at global default"
     );
 }
@@ -97,7 +98,7 @@ network = "bridge"
 
     let (eff, _, _) = resolve_config("mypkg", Some(&config_file)).unwrap();
 
-    assert_eq!(eff.network, "bridge");
+    assert_eq!(eff.network, NetworkPolicy::Named("bridge".to_string()));
     assert_eq!(
         eff.memory, "512m",
         "unset runtime fields fall back to global"
@@ -327,7 +328,8 @@ cpus   = "2.0"
     assert_eq!(eff.memory, "1g");
     assert_eq!(eff.cpus, "2.0");
     assert_eq!(
-        eff.network, "none",
+        eff.network,
+        NetworkPolicy::None,
         "unset fields still use compiled defaults"
     );
 }

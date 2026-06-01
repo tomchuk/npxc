@@ -161,14 +161,13 @@ async fn run_scenario(
 /// at `target/{profile}/npxc`.
 fn find_npxc() -> PathBuf {
     // current_exe() → target/{profile}/examples/mcp_probe
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(examples_dir) = exe.parent() {
-            if let Some(profile_dir) = examples_dir.parent() {
-                let candidate = profile_dir.join("npxc");
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(examples_dir) = exe.parent()
+        && let Some(profile_dir) = examples_dir.parent()
+    {
+        let candidate = profile_dir.join("npxc");
+        if candidate.exists() {
+            return candidate;
         }
     }
 
