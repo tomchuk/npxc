@@ -6,3 +6,8 @@
 
 /// The raw Dockerfile template string, embedded at compile time.
 pub const DOCKERFILE_TEMPLATE: &str = include_str!("../templates/Dockerfile.template");
+
+/// Dockerfile for the prebuilt userspace-WireGuard base image, which compiles
+/// `boringtun-cli` once into a tiny image that per-package builds `COPY --from`.
+/// Parameterized by the `BORINGTUN_VERSION` build arg.
+pub const WG_BASE_DOCKERFILE: &str = include_str!("../templates/Dockerfile.wg-base");

@@ -1,11 +1,10 @@
 ARG NODE_IMAGE=node:lts-slim
 ARG PACKAGE_SPEC
-
-# Build a userspace WireGuard (boringtun) for the guest. The container VM kernel
-# has no WireGuard module, so the guest brings up wg0 in userspace over a TUN
-# device instead. This stage is cached across image rebuilds.
-FROM rust:1-bookworm AS wgbuild
-RUN cargo install boringtun-cli --version 0.7.1 --root /usr/local
+# The `COPY --from` below pulls the prebuilt boringtun-cli binary from npxc's
+# WireGuard base image (the guest runs userspace WireGuard because the container
+# VM kernel has no WireGuard module). npxc substitutes the real image tag for
+# the `__NPXC_WG_BASE_IMAGE__` placeholder when it writes this Dockerfile;
+# `COPY --from` can't take a build ARG in this BuildKit frontend.
 
 FROM ${NODE_IMAGE} AS builder
 ARG PACKAGE_SPEC
@@ -67,8 +66,9 @@ RUN apt-get update \
  && rm -rf /usr/local/lib/node_modules/npm \
            /usr/local/bin/npm /usr/local/bin/npx \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
-# Userspace WireGuard daemon (kernel has no wireguard module).
-COPY --from=wgbuild /usr/local/bin/boringtun-cli /usr/local/bin/boringtun-cli
+# Userspace WireGuard daemon (kernel has no wireguard module), copied from the
+# prebuilt base image rather than recompiled here.
+COPY --from=__NPXC_WG_BASE_IMAGE__ /boringtun-cli /usr/local/bin/boringtun-cli
 WORKDIR /app
 COPY --from=builder --chown=node:node /app /app
 WORKDIR /workspace

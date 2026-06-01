@@ -193,6 +193,12 @@ pub struct Session {
     /// The per-session container network npxc created (if any). Deleted on
     /// teardown, after the container has stopped.
     network: Option<ManagedNetwork>,
+    /// Runtime CLI binary and the container's `--name`. Kept so teardown can
+    /// force-remove the container by name: sending SIGKILL to the local
+    /// `container run` client doesn't stop the container in the VM, which would
+    /// leave it running (holding the network) and orphaned.
+    container_cli: String,
+    container_name: String,
     /// Set once async [`teardown`] has cleaned up, so the synchronous [`Drop`]
     /// impl knows to skip its best-effort pass.
     ///
@@ -337,6 +343,8 @@ impl Session {
             session_dir,
             container: Some(container),
             network: None,
+            container_cli: config.container_cli.clone(),
+            container_name,
             cleaned: false,
         })
     }
@@ -372,19 +380,32 @@ impl Session {
         if let Some(ref mut c) = self.container {
             c.kill_and_wait().await;
         }
+        // Reaping the local `container run` client doesn't stop the container in
+        // the VM; force-remove it by name so it actually exits and releases the
+        // network (and isn't left orphaned).
+        force_remove_container(&self.container_cli, &self.container_name).await;
         let _ = tokio::fs::remove_dir_all(&self.session_dir).await;
-        // Delete the network only after the container has stopped.
+        // Delete the network now that the container is gone. A bounded retry
+        // absorbs the brief window where the runtime still reports it in use.
         if let Some(net) = self.network.take() {
-            if let Err(e) = net.delete().await {
-                tracing::warn!(
-                    network = %net.name(),
-                    error = %e,
-                    "failed to delete per-session network",
-                );
-            }
+            net.delete_with_retry().await;
         }
         self.cleaned = true;
     }
+}
+
+/// Force-remove a container by name (`container rm --force`), best-effort.
+///
+/// `--force` stops a running container before removing it, which releases the
+/// per-session network. Errors (e.g. the container is already gone because the
+/// `--rm` run exited cleanly) are ignored.
+async fn force_remove_container(container_cli: &str, name: &str) {
+    let _ = Command::new(container_cli)
+        .args(["rm", "--force", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 impl Drop for Session {
@@ -399,6 +420,12 @@ impl Drop for Session {
         if let Some(ref mut c) = self.container {
             c.kill_now();
         }
+        // Force-remove the container so it releases the network (sync, best-effort).
+        let _ = std::process::Command::new(&self.container_cli)
+            .args(["rm", "--force", &self.container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = std::fs::remove_dir_all(&self.session_dir);
         if let Some(net) = &self.network {
             net.delete_blocking();

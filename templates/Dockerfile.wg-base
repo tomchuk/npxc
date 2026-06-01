@@ -1,0 +1,14 @@
+# Prebuilt userspace-WireGuard base image.
+#
+# Compiles `boringtun-cli` once into a tiny `scratch` image so that per-package
+# builds just `COPY --from` the finished binary instead of recompiling it every
+# time. The compiled artifact lives in the image store, so it survives builder
+# teardown — npxc can keep a clean, ephemeral builder and still build packages
+# in seconds. Rebuilt only when BORINGTUN_VERSION changes (the tag is versioned).
+ARG BORINGTUN_VERSION
+FROM rust:1-bookworm AS build
+ARG BORINGTUN_VERSION
+RUN cargo install boringtun-cli --version "${BORINGTUN_VERSION}" --root /usr/local
+
+FROM scratch
+COPY --from=build /usr/local/bin/boringtun-cli /boringtun-cli

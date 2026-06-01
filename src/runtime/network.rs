@@ -6,6 +6,7 @@
 //! no direct egress — a later phase routes filtered egress through npxc itself.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
 use tracing::debug;
@@ -166,6 +167,32 @@ impl ManagedNetwork {
                 self.name,
                 status.code()
             )))
+        }
+    }
+
+    /// Delete the network, retrying a few times before giving up.
+    ///
+    /// `container` refuses to delete a network that's still in use; right after
+    /// the attached container is force-removed there can be a brief window where
+    /// the runtime still reports it busy. A handful of backed-off retries closes
+    /// that race. Warns (does not error) if it ultimately fails.
+    pub async fn delete_with_retry(&self) {
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            match self.delete().await {
+                Ok(()) => return,
+                Err(e) => {
+                    if attempt == ATTEMPTS {
+                        tracing::warn!(
+                            network = %self.name,
+                            error = %e,
+                            "failed to delete per-session network after {ATTEMPTS} attempts",
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150 * u64::from(attempt))).await;
+                }
+            }
         }
     }
 
