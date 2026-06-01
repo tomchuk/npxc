@@ -7,6 +7,29 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.3.0](https://github.com/tomchuk/npxc/compare/v0.2.0...v0.3.0) - 2026-06-01
+
+### Added
+
+- *(tunnel)* phase 3 — DNS pinning, IPv6, QUIC block, egress audit log
+- *(tunnel)* phase 2 — egress allowlist enforcement, validated live
+- *(tunnel)* phase 1 — image/session integration; egress validated live
+- *(tunnel)* phase 1 — ipstack datapath + forwarder
+- *(tunnel)* phase 1 — wireguard transport state machine
+- *(tunnel)* phase 1 — wireguard key layer + datapath crate stack
+- *(network)* phase 0 — per-session isolated network lifecycle
+
+### Fixed
+
+- *(runtime)* reliable teardown, reusable WireGuard base image, README
+- *(config)* use ~/.config/npxc and ~/.local/share/npxc on all platforms
+
+### Other
+
+- *(deps)* move to hickory-proto 0.26 (MSRV 1.88)
+- *(readme)* document filesystem, storage, and env features
+- *(tunnel)* zero-allocation wireguard transport
+
 ## [0.2.0](https://github.com/tomchuk/npxc/compare/v0.1.1...v0.2.0) - 2026-05-31
 
 ### Added
